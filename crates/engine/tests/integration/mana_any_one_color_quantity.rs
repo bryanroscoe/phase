@@ -6986,3 +6986,916 @@ fn manual_mana_ability_payment_keeps_selected_counted_source_output() {
         .any(|unit| unit.pip_id == aura_pip));
     assert_complete(&r, 6);
 }
+
+const LIVE_GUIDANCE: &str = "Enchant land\nWhenever enchanted land is tapped for mana, its controller adds an additional {G} for each Elf on the battlefield.";
+const LIVE_NEXUS: &str = "Creatures you control are every creature type. The same is true for creature spells you control and creature cards you own that aren't on the battlefield.\n{3}, {T}: Create a 2/2 blue Shapeshifter creature token with changeling. (It is every creature type.)";
+const LIVE_FINDBROKER: &str =
+    "When this creature enters, return target permanent card from your graveyard to your hand.";
+const LIVE_GATE: &str = "This land enters tapped.\n{T}: Add {G} or {U}.";
+const LIVE_BLOOM: &str =
+    "Whenever a Forest is tapped for mana, its controller adds an additional {G}.";
+const LIVE_TORQUE: &str = "{T}: Add {C}.\n{T}: Target nonland permanent becomes an artifact in addition to its other types until end of turn.";
+const LIVE_IRONWORKS: &str = "Sacrifice an artifact: Add {C}{C}.";
+
+#[derive(Clone, Copy)]
+struct LiveGuidanceSources {
+    land: ObjectId,
+    aura: ObjectId,
+    nexus: ObjectId,
+    thrull: ObjectId,
+    spare: ObjectId,
+    opponent: ObjectId,
+}
+
+fn live_guidance_sources(
+    s: &mut GameScenario,
+    land: ObjectId,
+    aura_controller: engine::types::player::PlayerId,
+    aura_name: &str,
+    aura_text: &str,
+    aura_cost: &str,
+) -> LiveGuidanceSources {
+    let aura = s
+        .add_enchantment_from_oracle(aura_controller, aura_name, aura_text)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(parse_mtgjson_mana_cost(aura_cost))
+        .id();
+    let nexus = s
+        .add_artifact_from_oracle(P0, "Maskwood Nexus", LIVE_NEXUS)
+        .with_mana_cost(parse_mtgjson_mana_cost("{4}"))
+        .id();
+    let thrull = s
+        .add_creature_from_oracle(P0, "Basal Thrull", 1, 2, BASAL_THRULL)
+        .with_subtypes(vec!["Thrull"])
+        .with_mana_cost(parse_mtgjson_mana_cost("{B}{B}"))
+        .id();
+    let spare = s
+        .add_land_from_oracle(P0, "Forest", "({T}: Add {G}.)")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    let opponent = s
+        .add_land_from_oracle(P1, "Forest", "({T}: Add {G}.)")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    LiveGuidanceSources {
+        land,
+        aura,
+        nexus,
+        thrull,
+        spare,
+        opponent,
+    }
+}
+
+fn live_guidance_finish(s: GameScenario, ids: LiveGuidanceSources) -> GameRunner {
+    let mut r = s.build();
+    let basics: Vec<_> = r
+        .state()
+        .objects
+        .values()
+        .filter(|object| {
+            object
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| matches!(subtype.as_str(), "Forest" | "Mountain"))
+        })
+        .map(|object| object.id)
+        .collect();
+    for basic in basics {
+        finish_snow_forest(&mut r, basic);
+    }
+    // CR 205.3m + CR 613.1d: supply the deck-loading catalog before Nexus's
+    // continuous type effect. Nexus is the printed Artifact, never another Elf.
+    r.state_mut().all_creature_types = ["Elf", "Thrull", "Shaman", "Shapeshifter"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // These are established permanents; Guildgate's enters-tapped event is past.
+    r.state_mut().objects.get_mut(&ids.land).unwrap().tapped = false;
+    engine::game::effects::attach::attach_to(r.state_mut(), ids.aura, ids.land);
+    evaluate_layers(r.state_mut());
+    assert_eq!(r.state().phase, Phase::PreCombatMain);
+    assert_eq!(r.state().active_player, P0);
+    assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert!(r.state().stack.is_empty());
+    assert!(r.state().players.iter().all(|p| p.mana_pool.is_empty()));
+    for id in [ids.land, ids.thrull, ids.spare, ids.opponent] {
+        assert_eq!(r.state().objects[&id].zone, Zone::Battlefield);
+        assert!(!r.state().objects[&id].tapped);
+    }
+    assert!(!r.state().objects[&ids.thrull].summoning_sick);
+    assert_eq!(
+        r.state().objects[&ids.nexus].card_types.core_types,
+        vec![engine::types::card_type::CoreType::Artifact]
+    );
+    assert!(r.state().objects[&ids.thrull]
+        .card_types
+        .subtypes
+        .contains(&"Elf".to_string()));
+    assert_eq!(
+        r.state()
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Battlefield
+                && o.card_types
+                    .core_types
+                    .contains(&engine::types::card_type::CoreType::Creature))
+            .map(|o| o.id)
+            .collect::<Vec<_>>(),
+        vec![ids.thrull]
+    );
+    assert_eq!(
+        r.state()
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Battlefield
+                && o.card_types.subtypes.contains(&"Elf".to_string()))
+            .count(),
+        1
+    );
+    assert!(!r.state().objects[&ids.nexus].statics.is_empty());
+    for id in [ids.land, ids.nexus, ids.thrull] {
+        assert!(r.state().objects[&id]
+            .abilities
+            .iter()
+            .all(|a| !matches!(&*a.effect, Effect::Unimplemented { .. })));
+    }
+    assert_eq!(r.state().objects[&ids.aura].triggers.len(), 1);
+    let trigger = &r.state().objects[&ids.aura].triggers[0].definition;
+    assert!(matches!(
+        trigger.execute.as_deref().map(|a| &*a.effect),
+        Some(Effect::Mana { .. })
+    ));
+    assert_eq!(
+        trigger.valid_target, None,
+        "the passive tap condition imposes no Aura-controller restriction"
+    );
+    assert_eq!(
+        trigger.execute.as_ref().unwrap().player_scope,
+        Some(engine::types::ability::PlayerFilter::TriggeringPlayer)
+    );
+    let rows = activatable_land_mana_options(r.state(), ids.land, P0);
+    assert!(rows.iter().any(|row| row.mana_type == ManaType::Green
+        && row.taps_for_mana_overrides.len() == 1
+        && row.taps_for_mana_overrides[0].0.source
+            == engine::types::identifiers::ObjectIncarnationRef::from_object(
+                &r.state().objects[&ids.aura]
+            )
+        && row.taps_for_mana_overrides[0].0.occurrence
+            == r.state().objects[&ids.aura].triggers[0].occurrence
+        && row.taps_for_mana_overrides[0].1
+            == engine::types::game_state::ProductionOverride::SingleColor(ManaType::Green)));
+    assert!(activatable_mana_options(r.state(), ids.thrull, P0)
+        .iter()
+        .any(|row| row.atomic_combination.as_deref() == Some(&[ManaType::Black, ManaType::Black])));
+    r
+}
+
+fn live_guidance_findbroker_board(
+    aura_controller: engine::types::player::PlayerId,
+) -> (GameRunner, LiveGuidanceSources, ObjectId) {
+    let mut s = board();
+    let land = s
+        .add_land_from_oracle(P0, "Simic Guildgate", LIVE_GATE)
+        .with_subtypes(vec!["Gate"])
+        .id();
+    let ids = live_guidance_sources(
+        &mut s,
+        land,
+        aura_controller,
+        "Elvish Guidance",
+        LIVE_GUIDANCE,
+        "{2}{G}",
+    );
+    let findbroker = s
+        .add_creature_to_hand_from_oracle(P0, "Golgari Findbroker", 3, 4, LIVE_FINDBROKER)
+        .with_subtypes(vec!["Elf", "Shaman"])
+        .with_mana_cost(parse_mtgjson_mana_cost("{B}{B}{G}{G}"))
+        .id();
+    let r = live_guidance_finish(s, ids);
+    assert!(activatable_land_mana_options(r.state(), land, P0)
+        .iter()
+        .any(|row| row.mana_type == ManaType::Blue && !row.taps_for_mana_overrides.is_empty()));
+    assert!(matches!(
+        r.state().objects[&findbroker].triggers[0]
+            .definition
+            .execute
+            .as_deref()
+            .map(|a| &*a.effect),
+        Some(Effect::ChangeZone { .. })
+    ));
+    (r, ids, findbroker)
+}
+
+fn live_guidance_gate_action(r: &GameRunner, ids: LiveGuidanceSources) -> GameAction {
+    let (_, _, grouped) = legal_actions_full(r.state());
+    let action = grouped[&ids.land].iter().find(|action| matches!(action,
+        GameAction::TapLandForMana { selection }
+        if selection.mana_type == ManaType::Green && selection.taps_for_mana.len() == 1
+            && selection.taps_for_mana[0].source
+                == engine::types::identifiers::ObjectIncarnationRef::from_object(&r.state().objects[&ids.aura])
+            && selection.taps_for_mana[0].production_override
+                == engine::types::game_state::ProductionOverride::SingleColor(ManaType::Green)))
+        .expect("the engine offers concrete Gate G with the exact live Guidance occurrence").clone();
+    let GameAction::TapLandForMana { selection } = &action else {
+        unreachable!()
+    };
+    let rows = activatable_land_mana_options(r.state(), ids.land, P0);
+    assert!(
+        rows.iter()
+            .filter_map(|row| row.semantic_selection(r.state()))
+            .any(|live| live == *selection),
+        "the complete occurrence/output selection is engine-authored"
+    );
+    action
+}
+
+fn assert_live_paid_four(
+    state: &engine::types::game_state::GameState,
+    events: &[engine::types::events::GameEvent],
+    spell: ObjectId,
+) {
+    // CR 601.2h + CR 601.2i: require committed complete payment, not only a
+    // successful action return or a preparatory projected affordability result.
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert_eq!(state.objects[&spell].mana_spent_to_cast_amount, 4);
+    assert_eq!(state.objects[&spell].mana_spent_source_snapshots.len(), 4);
+    assert_eq!(state.stack.len(), 1);
+    assert!(matches!(
+        &state.stack[0].kind,
+        engine::types::game_state::StackEntryKind::Spell { .. }
+    ));
+    assert_eq!(state.stack[0].source_id, spell);
+    assert!(matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert!(state.pending_cast.is_none());
+    assert!(!state.waiting_for.is_mana_ability_continuation());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+        engine::types::events::GameEvent::SpellCast { object_id, controller, .. }
+            if *object_id == spell && *controller == P0))
+            .count(),
+        1
+    );
+    assert!(state.players.iter().all(|p| p.mana_pool.is_empty()));
+}
+
+fn assert_live_findbroker_sources(
+    state: &engine::types::game_state::GameState,
+    events: &[engine::types::events::GameEvent],
+    ids: LiveGuidanceSources,
+    findbroker: ObjectId,
+) {
+    // CR 106.3 + CR 608.2h: the Aura's actual amount is live at its own
+    // resolution. Either legal activation chronology must fund printed BBGG.
+    assert_eq!(production_count(events, ids.thrull, ManaType::Black), 2);
+    assert_eq!(production_count(events, ids.land, ManaType::Green), 1);
+    let guidance = production_count(events, ids.aura, ManaType::Green);
+    let forest = production_count(events, ids.spare, ManaType::Green);
+    assert!(matches!((guidance, forest), (0, 1) | (1, 0)));
+    assert!(state.objects[&ids.land].tapped);
+    assert_eq!(state.objects[&ids.spare].tapped, forest == 1);
+    for source in [ids.thrull, ids.land] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+            engine::types::events::GameEvent::AbilityActivated { source_id, .. }
+                if *source_id == source))
+                .count(),
+            1
+        );
+    }
+    for (source, amount) in [
+        (ids.thrull, 2),
+        (ids.land, 1),
+        (ids.aura, guidance),
+        (ids.spare, forest),
+    ] {
+        assert_eq!(
+            state.objects[&findbroker]
+                .mana_spent_source_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_id == source)
+                .count(),
+            amount
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, engine::types::events::GameEvent::ManaAdded { .. }))
+            .count(),
+        4
+    );
+    assert!(!events.iter().any(|event| matches!(event,
+        engine::types::events::GameEvent::ManaAdded { player_id, source_id, .. }
+            if *player_id == P1 || *source_id == ids.opponent)));
+    assert!(!state.objects[&ids.opponent].tapped);
+    assert!(state.players.iter().all(|p| p.mana_pool.is_empty()));
+}
+
+/// CR 605.4a + CR 608.2h: sacrificed Thrull stops contributing an Elf to
+/// Guidance even though the selected Guildgate's own one-unit yield is fixed.
+#[test]
+fn live_guidance_auto_findbroker_uses_settled_output() {
+    for aura_controller in [P0, P1] {
+        let (mut r, ids, findbroker) = live_guidance_findbroker_board(aura_controller);
+        let paid = r
+            .cast(findbroker)
+            .payment_mode(CastPaymentMode::Auto)
+            .target_object(ids.thrull)
+            .commit();
+        assert_live_paid_four(paid.state(), paid.events(), findbroker);
+        assert_eq!(paid.state().objects[&ids.thrull].zone, Zone::Graveyard);
+        assert_live_findbroker_sources(paid.state(), paid.events(), ids, findbroker);
+        let outcome = paid.resolve();
+        // CR 701.21a + CR 400.7: the commit proves the sacrifice; the later
+        // printed ETB returns that permanent card without retroactive mana.
+        outcome.assert_zone(&[findbroker], Zone::Battlefield);
+        outcome.assert_zone(&[ids.thrull], Zone::Hand);
+        assert_live_findbroker_sources(outcome.state(), outcome.events(), ids, findbroker);
+        assert_complete(&r, 0);
+        assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+    }
+}
+
+/// CR 601.2g + CR 605.4a: an engine-authored concrete selection settles
+/// base G and Guidance G before returning to the same public payment window.
+#[test]
+fn live_guidance_gate_first_and_manual_window_keep_real_mana() {
+    let (mut r, ids, findbroker) = live_guidance_findbroker_board(P0);
+    let mut events = r.act(live_guidance_gate_action(&r, ids)).unwrap().events;
+    assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert!(!matches!(
+        r.state().waiting_for,
+        WaitingFor::ChooseManaColor { .. }
+    ));
+    assert_eq!(production_count(&events, ids.land, ManaType::Green), 1);
+    assert_eq!(production_count(&events, ids.aura, ManaType::Green), 1);
+    assert_eq!(
+        r.state().players[0].mana_pool.count_color(ManaType::Green),
+        2
+    );
+    assert_eq!(r.state().objects[&ids.thrull].zone, Zone::Battlefield);
+    assert!(!r.state().objects[&ids.thrull].tapped);
+    assert!(!r.state().objects[&ids.spare].tapped);
+    let paid = r.cast(findbroker).target_object(ids.thrull).commit();
+    let cast_event_count = paid.events().len();
+    events.extend_from_slice(paid.events());
+    assert_live_paid_four(paid.state(), &events, findbroker);
+    assert_live_findbroker_sources(paid.state(), &events, ids, findbroker);
+    let outcome = paid.resolve();
+    outcome.assert_zone(&[findbroker], Zone::Battlefield);
+    outcome.assert_zone(&[ids.thrull], Zone::Hand);
+    events.extend_from_slice(&outcome.events()[cast_event_count..]);
+    assert_live_findbroker_sources(outcome.state(), &events, ids, findbroker);
+    assert!(!r.state().objects[&ids.spare].tapped);
+    assert_complete(&r, 0);
+
+    let (mut r, ids, findbroker) = live_guidance_findbroker_board(P0);
+    let card_id = r.state().objects[&findbroker].card_id;
+    let mut events = r
+        .act(GameAction::CastSpell {
+            object_id: findbroker,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .unwrap()
+        .events;
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+    );
+    let pending = r.state().pending_cast.as_ref().unwrap();
+    assert_eq!(pending.object_id, findbroker);
+    assert_eq!(pending.cost, parse_mtgjson_mana_cost("{B}{B}{G}{G}"));
+    assert_eq!(pending.payment_mode, CastPaymentMode::Manual);
+    events.extend(r.act(live_guidance_gate_action(&r, ids)).unwrap().events);
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+    );
+    assert!(!matches!(
+        r.state().waiting_for,
+        WaitingFor::ChooseManaColor { .. }
+    ));
+    assert_eq!(
+        r.state().players[0].mana_pool.count_color(ManaType::Green),
+        2
+    );
+    assert_eq!(production_count(&events, ids.aura, ManaType::Green), 1);
+    events.extend(r.act(GameAction::PassPriority).unwrap().events);
+    assert_live_paid_four(r.state(), &events, findbroker);
+    assert_live_findbroker_sources(r.state(), &events, ids, findbroker);
+}
+
+/// CR 601.2g + CR 701.21a: excluded sacrifices remain a deliberate public
+/// choice after the nonsacrificial coupled source completes and replans.
+#[test]
+fn live_guidance_sacrificial_exclusion_keeps_consent() {
+    for back_first in [false, true] {
+        let (mut r, ids, findbroker) = live_guidance_findbroker_board(P0);
+        let card_id = r.state().objects[&findbroker].card_id;
+        let mut events = r
+            .act(GameAction::CastSpell {
+                object_id: findbroker,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::AutoExceptSacrificialMana,
+            })
+            .unwrap()
+            .events;
+        let WaitingFor::ManaSourceSelection {
+            player, options, ..
+        } = &r.state().waiting_for
+        else {
+            panic!("Thrull's sacrifice requires consent");
+        };
+        assert_eq!(*player, P0);
+        let selection = options
+            .iter()
+            .find(|selection| {
+                selection.source.object_id == ids.thrull
+                    && selection.atomic_combination.as_deref()
+                        == Some(&[ManaType::Black, ManaType::Black])
+            })
+            .expect("the engine offers Thrull's complete BB capability")
+            .clone();
+        let pending = r.state().pending_cast.as_ref().unwrap();
+        assert_eq!(pending.object_id, findbroker);
+        assert_eq!(pending.cost, parse_mtgjson_mana_cost("{B}{B}{G}{G}"));
+        assert_eq!(
+            pending.payment_mode,
+            CastPaymentMode::AutoExceptSacrificialMana
+        );
+        assert_eq!(production_count(&events, ids.aura, ManaType::Green), 1);
+        assert_eq!(
+            r.state().players[0].mana_pool.count_color(ManaType::Green),
+            2
+        );
+        assert_eq!(r.state().objects[&ids.thrull].zone, Zone::Battlefield);
+        assert!(!r.state().objects[&ids.thrull].tapped);
+        assert!(!r.state().objects[&ids.spare].tapped);
+        assert!(!r.state().objects[&ids.opponent].tapped);
+        if back_first {
+            let pool = r.state().players[0].mana_pool.clone();
+            let pending = r.state().pending_cast.clone();
+            r.act(GameAction::BackToManaPayment).unwrap();
+            assert!(
+                matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+            );
+            assert_eq!(r.state().players[0].mana_pool, pool);
+            assert_eq!(r.state().pending_cast, pending);
+            assert_eq!(r.state().objects[&ids.thrull].zone, Zone::Battlefield);
+            assert!(!r.state().objects[&ids.thrull].tapped);
+            r.act(GameAction::CancelCast).unwrap();
+            assert_eq!(r.state().objects[&findbroker].zone, Zone::Hand);
+            assert!(r.state().pending_cast.is_none());
+            assert_complete(&r, 2);
+        } else {
+            events.extend(
+                r.act(GameAction::ActivateManaSource { selection })
+                    .unwrap()
+                    .events,
+            );
+            assert_eq!(production_count(&events, ids.thrull, ManaType::Black), 2);
+            assert_eq!(r.state().objects[&ids.thrull].zone, Zone::Graveyard);
+            assert!(
+                matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+            );
+            events.extend(r.act(GameAction::PassPriority).unwrap().events);
+            assert_live_paid_four(r.state(), &events, findbroker);
+            assert_live_findbroker_sources(r.state(), &events, ids, findbroker);
+        }
+    }
+}
+
+/// CR 305.6 + CR 605.4a: normally layered Forests have indexed intrinsic
+/// mana abilities, whose separate fixed or live triggered tail settles first.
+#[test]
+fn live_guidance_basic_land_and_fixed_tails_settle_before_residual() {
+    for (aura_name, aura_text, aura_cost) in [
+        ("Elvish Guidance", LIVE_GUIDANCE, "{2}{G}"),
+        ("Wild Growth", WILD_GROWTH, "{G}"),
+    ] {
+        let mut s = board();
+        let land = s
+            .add_land_from_oracle(P0, "Forest", "({T}: Add {G}.)")
+            .with_subtypes(vec!["Forest"])
+            .id();
+        let ids = live_guidance_sources(&mut s, land, P0, aura_name, aura_text, aura_cost);
+        let mountains: Vec<_> = (0..2)
+            .map(|_| {
+                s.add_land_from_oracle(P0, "Mountain", "({T}: Add {R}.)")
+                    .with_subtypes(vec!["Mountain"])
+                    .id()
+            })
+            .collect();
+        let harmonize = spell(&mut s, "Harmonize", false, "Draw three cards.", "{2}{G}{G}");
+        let mut r = live_guidance_finish(s, ids);
+        let paid = r
+            .cast(harmonize)
+            .payment_mode(CastPaymentMode::Auto)
+            .commit();
+        assert_live_paid_four(paid.state(), paid.events(), harmonize);
+        assert_eq!(production_count(paid.events(), land, ManaType::Green), 1);
+        assert_eq!(
+            production_count(paid.events(), ids.aura, ManaType::Green),
+            1
+        );
+        assert_eq!(
+            production_count(paid.events(), ids.thrull, ManaType::Black),
+            0
+        );
+        assert_eq!(paid.state().objects[&ids.thrull].zone, Zone::Battlefield);
+        let ordinary = [mountains[0], mountains[1], ids.spare];
+        assert_eq!(
+            ordinary
+                .iter()
+                .filter(|id| paid.state().objects[id].tapped)
+                .count(),
+            2
+        );
+        assert_eq!(
+            paid.events()
+                .iter()
+                .filter(|event| matches!(event,
+            engine::types::events::GameEvent::AbilityActivated { source_id, .. }
+                if ordinary.contains(source_id)))
+                .count(),
+            2
+        );
+        for source in [land, ids.aura] {
+            assert_eq!(
+                paid.state().objects[&harmonize]
+                    .mana_spent_source_snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.source_id == source)
+                    .count(),
+                1
+            );
+        }
+        assert!(!paid.state().objects[&ids.opponent].tapped);
+        let outcome = paid.resolve();
+        outcome.assert_hand_drawn(P0, 3);
+        outcome.assert_zone(&[harmonize], Zone::Graveyard);
+        assert_eq!(
+            production_count(outcome.events(), ids.aura, ManaType::Green),
+            1
+        );
+        assert_eq!(
+            ordinary
+                .iter()
+                .filter(|id| outcome.state().objects[id].tapped)
+                .count(),
+            2
+        );
+        assert_eq!(outcome.state().objects[&ids.thrull].zone, Zone::Battlefield);
+        assert!(!outcome.state().objects[&ids.opponent].tapped);
+        assert_complete(&r, 0);
+        assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+    }
+}
+
+/// CR 106.12a + CR 605.4a: the same Bloom occurrence supplies one G for
+/// each completed Forest tap; settling one tap cannot suppress the next.
+#[test]
+fn live_guidance_shared_vernal_bloom_settles_once_per_completed_forest() {
+    let mut s = board();
+    let bloom = s
+        .add_enchantment_from_oracle(P0, "Vernal Bloom", LIVE_BLOOM)
+        .with_mana_cost(parse_mtgjson_mana_cost("{3}{G}"))
+        .id();
+    let forests: Vec<_> = (0..3)
+        .map(|_| {
+            s.add_land_from_oracle(P0, "Forest", "({T}: Add {G}.)")
+                .with_subtypes(vec!["Forest"])
+                .id()
+        })
+        .collect();
+    let opponent = s
+        .add_land_from_oracle(P1, "Forest", "({T}: Add {G}.)")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    let harmonize = spell(&mut s, "Harmonize", false, "Draw three cards.", "{2}{G}{G}");
+    let mut r = s.build();
+    for forest in forests.iter().chain(std::iter::once(&opponent)) {
+        finish_snow_forest(&mut r, *forest);
+    }
+    evaluate_layers(r.state_mut());
+    assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert!(r.state().stack.is_empty());
+    assert!(r.state().players.iter().all(|p| p.mana_pool.is_empty()));
+    let mut selected = Vec::new();
+    for forest in &forests {
+        assert!(!r.state().objects[forest].tapped);
+        let rows = activatable_land_mana_options(r.state(), *forest, P0);
+        let row = rows
+            .iter()
+            .find(|row| row.mana_type == ManaType::Green && row.taps_for_mana_overrides.len() == 1)
+            .expect("each real Forest carries Bloom");
+        let (definition, output) = &row.taps_for_mana_overrides[0];
+        assert_eq!(
+            definition.source,
+            engine::types::identifiers::ObjectIncarnationRef::from_object(
+                &r.state().objects[&bloom]
+            )
+        );
+        assert_eq!(
+            definition.occurrence,
+            r.state().objects[&bloom].triggers[0].occurrence
+        );
+        assert_eq!(
+            *output,
+            engine::types::game_state::ProductionOverride::SingleColor(ManaType::Green)
+        );
+        selected.push(definition.clone());
+    }
+    assert!(selected.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(matches!(
+        r.state().objects[&bloom].triggers[0]
+            .definition
+            .execute
+            .as_deref()
+            .map(|a| &*a.effect),
+        Some(Effect::Mana { .. })
+    ));
+    let paid = r
+        .cast(harmonize)
+        .payment_mode(CastPaymentMode::Auto)
+        .commit();
+    assert_live_paid_four(paid.state(), paid.events(), harmonize);
+    let taps: Vec<_> = paid
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            engine::types::events::GameEvent::AbilityActivated { source_id, .. }
+                if forests.contains(source_id) =>
+            {
+                Some((index, *source_id))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(taps.len(), 2);
+    assert_ne!(taps[0].1, taps[1].1);
+    for (position, (start, forest)) in taps.iter().enumerate() {
+        let end = taps
+            .get(position + 1)
+            .map_or(paid.events().len(), |tap| tap.0);
+        let segment = &paid.events()[*start..end];
+        assert_eq!(production_count(segment, *forest, ManaType::Green), 1);
+        assert_eq!(production_count(segment, bloom, ManaType::Green), 1);
+        assert_eq!(
+            segment
+                .iter()
+                .filter(|event| matches!(event,
+            engine::types::events::GameEvent::TappedForMana { source_id, produced, .. }
+                if *source_id == *forest && *produced == [ManaType::Green]))
+                .count(),
+            1
+        );
+        assert_eq!(
+            paid.state().objects[&harmonize]
+                .mana_spent_source_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_id == *forest)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(production_count(paid.events(), bloom, ManaType::Green), 2);
+    assert_eq!(
+        paid.state().objects[&harmonize]
+            .mana_spent_source_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_id == bloom)
+            .count(),
+        2
+    );
+    assert_eq!(
+        forests
+            .iter()
+            .filter(|forest| !paid.state().objects[forest].tapped)
+            .count(),
+        1
+    );
+    assert!(!paid.state().objects[&opponent].tapped);
+    assert!(!paid.events().iter().any(|event| matches!(event,
+        engine::types::events::GameEvent::ManaAdded { player_id, source_id, .. }
+            if *player_id == P1 || *source_id == opponent)));
+    let outcome = paid.resolve();
+    outcome.assert_hand_drawn(P0, 3);
+    outcome.assert_zone(&[harmonize], Zone::Graveyard);
+    assert_eq!(
+        production_count(outcome.events(), bloom, ManaType::Green),
+        2
+    );
+    assert_eq!(
+        outcome
+            .events()
+            .iter()
+            .filter(|event| matches!(event,
+        engine::types::events::GameEvent::AbilityActivated { source_id, .. }
+            if forests.contains(source_id)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        forests
+            .iter()
+            .filter(|forest| !outcome.state().objects[forest].tapped)
+            .count(),
+        1
+    );
+    assert!(!outcome.state().objects[&opponent].tapped);
+    assert!(outcome.state().players[1].mana_pool.is_empty());
+    assert_complete(&r, 0);
+    assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+}
+
+/// CR 400.7 + CR 701.21a: a removed selected producer cannot be rebound;
+/// the fresh residual uses only KCI's actual CC and live land capabilities.
+#[test]
+fn live_guidance_removed_producer_selection_is_not_rebound() {
+    let mut s = board();
+    let land = s
+        .add_land_from_oracle(P0, "Simic Guildgate", LIVE_GATE)
+        .with_subtypes(vec!["Gate"])
+        .id();
+    let ids = live_guidance_sources(&mut s, land, P0, "Elvish Guidance", LIVE_GUIDANCE, "{2}{G}");
+    let ironworks = s
+        .add_artifact_from_oracle(P0, "Krark-Clan Ironworks", LIVE_IRONWORKS)
+        .with_mana_cost(parse_mtgjson_mana_cost("{4}"))
+        .id();
+    let torque = s
+        .add_artifact_from_oracle(P0, "Liquimetal Torque", LIVE_TORQUE)
+        .with_mana_cost(parse_mtgjson_mana_cost("{2}"))
+        .id();
+    let harmonize = spell(&mut s, "Harmonize", false, "Draw three cards.", "{2}{G}{G}");
+    let mut r = live_guidance_finish(s, ids);
+    let torque_index = r.state().objects[&torque]
+        .abilities
+        .iter()
+        .position(|ability| !engine::game::mana_abilities::is_mana_ability(ability))
+        .unwrap();
+    let changed = r
+        .activate(torque, torque_index)
+        .target_object(ids.aura)
+        .resolve();
+    assert!(changed.state().objects[&ids.aura]
+        .card_types
+        .core_types
+        .contains(&engine::types::card_type::CoreType::Artifact));
+    assert!(r.state().objects[&torque].tapped);
+    assert_complete(&r, 0);
+    let stale = live_guidance_gate_action(&r, ids);
+    let card_id = r.state().objects[&harmonize].card_id;
+    let mut events = r
+        .act(GameAction::CastSpell {
+            object_id: harmonize,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .unwrap()
+        .events;
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+    );
+    assert_eq!(
+        r.state().pending_cast.as_ref().unwrap().cost,
+        parse_mtgjson_mana_cost("{2}{G}{G}")
+    );
+    assert_eq!(
+        r.state().pending_cast.as_ref().unwrap().payment_mode,
+        CastPaymentMode::Manual
+    );
+    let ironworks_index = r.state().objects[&ironworks]
+        .abilities
+        .iter()
+        .position(engine::game::mana_abilities::is_mana_ability)
+        .unwrap();
+    let action = legal_actions(r.state())
+        .into_iter()
+        .find(|action| {
+            matches!(action,
+        GameAction::ActivateAbility { source_id, ability_index, .. }
+            if *source_id == ironworks && *ability_index == ironworks_index)
+        })
+        .expect("the manual mana window offers KCI's real player-choice ability");
+    events.extend(r.act(action).unwrap().events);
+    let WaitingFor::PayCost {
+        player,
+        kind,
+        choices,
+        count,
+        resume,
+        ..
+    } = &r.state().waiting_for
+    else {
+        panic!("KCI must request its actual artifact sacrifice");
+    };
+    assert_eq!(*player, P0);
+    assert_eq!(*kind, PayCostKind::Sacrifice);
+    assert_eq!(*count, 1);
+    assert!(choices.contains(&ids.aura));
+    let engine::types::game_state::CostResume::ManaAbility { mana_ability } = resume else {
+        panic!("the sacrifice must belong to the in-flight KCI activation");
+    };
+    assert_eq!(mana_ability.source_id, ironworks);
+    events.extend(
+        r.act(GameAction::SelectCards {
+            cards: vec![ids.aura],
+        })
+        .unwrap()
+        .events,
+    );
+    assert_eq!(r.state().objects[&ids.aura].zone, Zone::Graveyard);
+    assert_eq!(production_count(&events, ironworks, ManaType::Colorless), 2);
+    assert_eq!(production_count(&events, ids.aura, ManaType::Green), 0);
+    assert_eq!(
+        r.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Colorless),
+        2
+    );
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::ManaPayment { player, .. } if player == P0)
+    );
+    let pool = r.state().players[0].mana_pool.clone();
+    let pending = r.state().pending_cast.clone();
+    let aura_incarnation = engine::types::identifiers::ObjectIncarnationRef::from_object(
+        &r.state().objects[&ids.aura],
+    );
+    let error = r.act(stale.clone()).unwrap_err();
+    assert!(
+        matches!(error, engine::game::engine::EngineError::ActionNotAllowed(ref message)
+        if message == "Mana source selection is stale or no longer legal")
+    );
+    assert_eq!(r.state().players[0].mana_pool, pool);
+    assert_eq!(r.state().pending_cast, pending);
+    assert!(!r.state().objects[&land].tapped);
+    assert_eq!(
+        engine::types::identifiers::ObjectIncarnationRef::from_object(
+            &r.state().objects[&ids.aura]
+        ),
+        aura_incarnation
+    );
+    let (_, _, grouped) = legal_actions_full(r.state());
+    let fresh = grouped[&land]
+        .iter()
+        .find(|action| {
+            matches!(action,
+        GameAction::TapLandForMana { selection }
+            if selection.mana_type == ManaType::Green && selection.taps_for_mana.is_empty())
+        })
+        .expect("the fresh Gate capability excludes the departed Aura");
+    assert_ne!(*fresh, stale);
+    events.extend(r.act(GameAction::PassPriority).unwrap().events);
+    assert_live_paid_four(r.state(), &events, harmonize);
+    for source in [land, ids.spare] {
+        assert_eq!(production_count(&events, source, ManaType::Green), 1);
+        assert!(r.state().objects[&source].tapped);
+        assert_eq!(
+            r.state().objects[&harmonize]
+                .mana_spent_source_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_id == source)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        r.state().objects[&harmonize]
+            .mana_spent_source_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_id == ironworks)
+            .count(),
+        2
+    );
+    assert_eq!(r.state().objects[&ids.thrull].zone, Zone::Battlefield);
+    assert_eq!(production_count(&events, ids.thrull, ManaType::Black), 0);
+    let hand_before = r.state().players[0].hand.len();
+    for _ in 0..8 {
+        if r.state().stack.is_empty() {
+            break;
+        }
+        assert!(matches!(r.state().waiting_for, WaitingFor::Priority { .. }));
+        events.extend(r.act(GameAction::PassPriority).unwrap().events);
+    }
+    assert_eq!(r.state().players[0].hand.len() - hand_before, 3);
+    assert_eq!(r.state().objects[&harmonize].zone, Zone::Graveyard);
+    assert_eq!(production_count(&events, ironworks, ManaType::Colorless), 2);
+    assert_eq!(production_count(&events, ids.aura, ManaType::Green), 0);
+    assert!(!events.iter().any(|event| matches!(event,
+        engine::types::events::GameEvent::ManaAdded { player_id, source_id, .. }
+            if *player_id == P1 || *source_id == ids.opponent)));
+    assert!(!r.state().objects[&ids.opponent].tapped);
+    assert!(r.state().players[1].mana_pool.is_empty());
+    assert_complete(&r, 0);
+    assert!(matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0));
+}
