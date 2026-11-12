@@ -1201,16 +1201,22 @@ pub(crate) fn reduce_cost_by_pool_with_fundability(
     demand: Option<&ColorDemand>,
     fundable: Option<&dyn Fn(&ManaCost) -> bool>,
 ) -> ManaCost {
+    #[cfg(test)]
+    let work_root = HybridWorkRoot::reducer(cost, fundable.is_some());
     let (shards, generic) = match cost {
         ManaCost::NoCost
         | ManaCost::SelfManaCost
         | ManaCost::SelfManaValue
-        | ManaCost::SelfManaCostReduced { .. } => return cost.clone(),
+        | ManaCost::SelfManaCostReduced { .. } => {
+            #[cfg(test)]
+            work_root.residual(cost);
+            return cost.clone();
+        }
         ManaCost::Cost { shards, generic } => (shards, *generic),
     };
 
     let order = payment_shard_order(shards, None);
-    reduce_cost_by_pool_from(
+    let residual = reduce_cost_by_pool_from(
         pool,
         PaymentContinuation {
             shards,
@@ -1224,7 +1230,10 @@ pub(crate) fn reduce_cost_by_pool_with_fundability(
         demand,
         &[],
         fundable,
-    )
+    );
+    #[cfg(test)]
+    work_root.residual(&residual);
+    residual
 }
 
 /// The original cost and traversal at a source-quality selection seam. Keeping
@@ -1318,11 +1327,15 @@ impl PaymentContinuation<'_> {
         preferred_hybrid_colors: &[(ManaType, ManaType, ManaType)],
         max_life_payments: Option<usize>,
     ) -> Result<(Vec<ManaUnit>, Vec<LifePayment>), PaymentError> {
+        #[cfg(test)]
+        record_hybrid_work(HybridWorkEvent::PaymentEntry);
         let mut failure = PaymentError::InsufficientMana;
         // CR 107.4e + CR 118.3a: pins prioritize eligible units, not a
         // particular hybrid shard. Keep the other half as a payable fallback.
         for color in [colors.0, colors.1] {
             let mut remaining = pool.clone();
+            #[cfg(test)]
+            record_hybrid_work(HybridWorkEvent::PaymentAlternativeClone);
             let Some(unit) =
                 spend_eligible(&mut remaining, color, spell, pins, self.quality_demand)
             else {
@@ -1370,6 +1383,8 @@ impl PaymentContinuation<'_> {
         life_budget: u32,
         preferred_hybrid_colors: &mut Vec<(ManaType, ManaType, ManaType)>,
     ) -> ManaType {
+        #[cfg(test)]
+        let _work_attempt = HybridWorkRoot::payment("preview", self);
         let color = self
             .pay_hybrid_and_suffix(
                 &mut pool.clone(),
@@ -1499,6 +1514,205 @@ impl PaymentContinuation<'_> {
 thread_local! {
     static HYBRID_ALTERNATIVE_ENTRIES: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static HYBRID_PAYMENT_WORK: std::cell::RefCell<Option<HybridPaymentWork>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct HybridReductionWork {
+    cost: ManaCost,
+    fundable: bool,
+    requests: usize,
+    entry_clones: usize,
+    alternative_entries: usize,
+    alternative_clones: usize,
+    reuse: usize,
+    residual: Option<ManaCost>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct HybridSelectorWork {
+    label: &'static str,
+    cost: ManaCost,
+    next_position: usize,
+    entries: usize,
+    alternative_clones: usize,
+    count_rejections: usize,
+    failed_key_hits: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct HybridPaymentWork {
+    label: &'static str,
+    entry_clone_limit: usize,
+    payment_clone_limit: usize,
+    reductions: Vec<HybridReductionWork>,
+    selectors: Vec<HybridSelectorWork>,
+    current_reduction: Option<usize>,
+    current_selector: Option<usize>,
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared observer includes memo events absent in the pre-repair comparison"
+)]
+enum HybridWorkEvent {
+    ReducerRequest,
+    ReducerEntryClone,
+    ReducerAlternativeEntry,
+    ReducerAlternativeClone,
+    ResidualHit,
+    PaymentEntry,
+    PaymentAlternativeClone,
+    CountRejection,
+    FailedKeyHit,
+}
+
+#[cfg(test)]
+fn record_hybrid_work(event: HybridWorkEvent) {
+    HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+        let Some(work) = work else { return };
+        match event {
+            HybridWorkEvent::ReducerRequest
+            | HybridWorkEvent::ReducerEntryClone
+            | HybridWorkEvent::ReducerAlternativeEntry
+            | HybridWorkEvent::ReducerAlternativeClone
+            | HybridWorkEvent::ResidualHit => {
+                let root = &mut work.reductions[work.current_reduction.expect("reduction root")];
+                match event {
+                    HybridWorkEvent::ReducerRequest => root.requests += 1,
+                    HybridWorkEvent::ReducerEntryClone => {
+                        root.entry_clones += 1;
+                        assert!(root.entry_clones <= work.entry_clone_limit,
+                            "{}: actual fundable reducer entry scratch-clone ceiling exceeded: E={} > B={}, root {:?}",
+                            work.label, root.entry_clones, work.entry_clone_limit, root.cost);
+                    }
+                    HybridWorkEvent::ReducerAlternativeEntry => root.alternative_entries += 1,
+                    HybridWorkEvent::ReducerAlternativeClone => root.alternative_clones += 1,
+                    HybridWorkEvent::ResidualHit => root.reuse += 1,
+                    _ => unreachable!(),
+                }
+            }
+            HybridWorkEvent::PaymentEntry
+            | HybridWorkEvent::PaymentAlternativeClone
+            | HybridWorkEvent::CountRejection
+            | HybridWorkEvent::FailedKeyHit => {
+                let attempt = &mut work.selectors[work.current_selector.expect("payment proof root")];
+                match event {
+                    HybridWorkEvent::PaymentEntry => attempt.entries += 1,
+                    HybridWorkEvent::PaymentAlternativeClone => {
+                        attempt.alternative_clones += 1;
+                        assert!(attempt.alternative_clones <= work.payment_clone_limit,
+                            "{} / {}: actual suffix branch-clone ceiling exceeded: {} > {}, root {:?}",
+                            work.label, attempt.label, attempt.alternative_clones, work.payment_clone_limit, attempt.cost);
+                    }
+                    HybridWorkEvent::CountRejection => attempt.count_rejections += 1,
+                    HybridWorkEvent::FailedKeyHit => attempt.failed_key_hits += 1,
+                    _ => unreachable!(),
+                }
+            }
+        }
+    });
+}
+
+/// Stack-scoped attribution also isolates nested Z proofs and independent retries.
+#[cfg(test)]
+struct HybridWorkRoot {
+    reduction: bool,
+    id: Option<usize>,
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl HybridWorkRoot {
+    fn reducer(cost: &ManaCost, fundable: bool) -> Self {
+        HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+            let Some(work) = work else {
+                return Self {
+                    reduction: true,
+                    id: None,
+                    previous: None,
+                };
+            };
+            let id = work.reductions.len();
+            let previous = work.current_reduction.replace(id);
+            work.reductions.push(HybridReductionWork {
+                cost: cost.clone(),
+                fundable,
+                requests: 0,
+                entry_clones: 0,
+                alternative_entries: 0,
+                alternative_clones: 0,
+                reuse: 0,
+                residual: None,
+            });
+            Self {
+                reduction: true,
+                id: Some(id),
+                previous,
+            }
+        })
+    }
+
+    fn payment(label: &'static str, continuation: PaymentContinuation<'_>) -> Self {
+        HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+            let Some(work) = work else {
+                return Self {
+                    reduction: false,
+                    id: None,
+                    previous: None,
+                };
+            };
+            let id = work.selectors.len();
+            let previous = work.current_selector.replace(id);
+            work.selectors.push(HybridSelectorWork {
+                label,
+                cost: ManaCost::Cost {
+                    shards: continuation.shards.to_vec(),
+                    generic: continuation.generic,
+                },
+                next_position: continuation.next_position,
+                entries: 0,
+                alternative_clones: 0,
+                count_rejections: 0,
+                failed_key_hits: 0,
+            });
+            Self {
+                reduction: false,
+                id: Some(id),
+                previous,
+            }
+        })
+    }
+
+    fn residual(&self, residual: &ManaCost) {
+        HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+            if let Some((work, id)) = work.as_mut().zip(self.id) {
+                work.reductions[id].residual = Some(residual.clone());
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for HybridWorkRoot {
+    fn drop(&mut self) {
+        if self.id.is_some() {
+            HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+                if let Some(work) = work {
+                    if self.reduction {
+                        work.current_reduction = self.previous;
+                    } else {
+                        work.current_selector = self.previous;
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1511,6 +1725,10 @@ fn reduce_cost_by_pool_from(
     residual_prefix: &[Option<ManaCostShard>],
     fundable: Option<&dyn Fn(&ManaCost) -> bool>,
 ) -> ManaCost {
+    #[cfg(test)]
+    if fundable.is_some() {
+        record_hybrid_work(HybridWorkEvent::ReducerRequest);
+    }
     let PaymentContinuation {
         shards,
         generic,
@@ -1520,6 +1738,10 @@ fn reduce_cost_by_pool_from(
     } = continuation;
     let any_color = mana_spend_permission.is_some();
     let mut scratch = pool.clone();
+    #[cfg(test)]
+    if fundable.is_some() {
+        record_hybrid_work(HybridWorkEvent::ReducerEntryClone);
+    }
     let mut residual_shards = vec![None; shards.len()];
     residual_shards[..residual_prefix.len()].copy_from_slice(residual_prefix);
     let mut residual_generic = generic;
@@ -1557,11 +1779,15 @@ fn reduce_cost_by_pool_from(
                     entries.set(Some(count + 1));
                 }
             });
+            #[cfg(test)]
+            record_hybrid_work(HybridWorkEvent::ReducerAlternativeEntry);
             let preferred = remaining_payment.hybrid_color(&scratch, a, b, spell, &[]);
             let other = if preferred == a { b } else { a };
             let mut residuals = Vec::new();
             for color in [preferred, other] {
                 let mut branch = scratch.clone();
+                #[cfg(test)]
+                record_hybrid_work(HybridWorkEvent::ReducerAlternativeClone);
                 if spend_eligible(&mut branch, color, spell, &[], quality_demand).is_none() {
                     continue;
                 }
@@ -1769,6 +1995,8 @@ fn reduce_cost_by_pool_from(
                         }
                         // Reduction never spends life. Check the same mana-only
                         // suffix against actual dispatch, without reordering it.
+                        #[cfg(test)]
+                        let _work_attempt = HybridWorkRoot::payment("reducer Z proof", suffix);
                         pay_cost_with_demand_and_choices_from(
                             &mut remaining.clone(),
                             suffix,
@@ -2046,6 +2274,21 @@ fn pay_cost_with_demand_and_choices_once(
         | ManaCost::SelfManaCostReduced { .. } => Ok((Vec::new(), Vec::new())),
         ManaCost::Cost { shards, generic } => {
             let order = payment_shard_order(shards, Some(life_colors));
+            #[cfg(test)]
+            let _work_attempt = HybridWorkRoot::payment(
+                if hand_demand.is_some() {
+                    "selector with demand"
+                } else {
+                    "selector"
+                },
+                PaymentContinuation {
+                    shards,
+                    generic: *generic,
+                    order: &order,
+                    next_position: 0,
+                    quality_demand: SourceQualityDemand::from_shards(shards),
+                },
+            );
             pay_cost_with_demand_and_choices_from(
                 pool,
                 PaymentContinuation {
@@ -2293,6 +2536,8 @@ fn pay_cost_with_demand_and_choices_from(
                     &future_demand,
                     minimum_life,
                     |remaining| {
+                        #[cfg(test)]
+                        let _work_attempt = HybridWorkRoot::payment("payment Z proof", suffix);
                         pay_cost_with_demand_and_choices_from(
                             &mut remaining.clone(),
                             PaymentContinuation {
@@ -2827,6 +3072,8 @@ pub fn compute_phyrexian_shards(
                     &future_demand,
                     minimum_life,
                     |remaining| {
+                        #[cfg(test)]
+                        let _work_attempt = HybridWorkRoot::payment("preview Z proof", suffix);
                         pay_cost_with_demand_and_choices_from(
                             &mut remaining.clone(),
                             PaymentContinuation {
@@ -4488,6 +4735,870 @@ mod tests {
             cant_spend_mana,
             ..Default::default()
         }
+    }
+
+    const DJINN_ILLUMINATUS_ORACLE: &str = "({U/R} can be paid with either {U} or {R}.)\nFlying\nEach instant and sorcery spell you cast has replicate. The replicate cost is equal to its mana cost. (When you cast it, copy it for each time you paid its replicate cost. You may choose new targets for the copies.)";
+    const MANAMORPHOSE_ORACLE: &str = "Add two mana in any combination of colors.\nDraw a card.";
+    const FOOD_CHAIN_ORACLE: &str = "Exile a creature you control: Add X mana of any one color, where X is 1 plus the exiled creature's mana value. Spend this mana only to cast creature spells.";
+
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::actions::GameAction;
+    use crate::types::game_state::{CastPaymentMode, WaitingFor};
+
+    struct DjinnManamorphoseFixture {
+        runner: GameRunner,
+        djinn: ObjectId,
+        spell: ObjectId,
+        food_chain: Option<(ObjectId, ObjectId)>,
+    }
+
+    fn djinn_manamorphose_board() -> (GameScenario, ObjectId, ObjectId) {
+        use crate::types::mana::parse_mtgjson_mana_cost;
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let djinn = scenario
+            .add_creature_from_oracle(P0, "Djinn Illuminatus", 3, 5, DJINN_ILLUMINATUS_ORACLE)
+            .with_mana_cost(parse_mtgjson_mana_cost("{5}{U/R}{U/R}"))
+            .with_subtypes(vec!["Djinn"])
+            .id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "Manamorphose", true, MANAMORPHOSE_ORACLE)
+            .with_mana_cost(parse_mtgjson_mana_cost("{1}{R/G}"))
+            .id();
+        (scenario, djinn, spell)
+    }
+
+    fn homogeneous_djinn_manamorphose(
+        r: usize,
+        g: usize,
+        c: usize,
+        food_chain: bool,
+    ) -> DjinnManamorphoseFixture {
+        let (mut scenario, djinn, spell) = djinn_manamorphose_board();
+        let food_chain = food_chain.then(|| {
+            let chain = scenario
+                .add_enchantment_from_oracle(P0, "Food Chain", FOOD_CHAIN_ORACLE)
+                .with_mana_cost(crate::types::mana::parse_mtgjson_mana_cost("{2}{G}"))
+                .id();
+            let bears = scenario
+                .add_creature_from_oracle(P0, "Grizzly Bears", 2, 2, "")
+                .with_mana_cost(crate::types::mana::parse_mtgjson_mana_cost("{1}{G}"))
+                .with_subtypes(vec!["Bear"])
+                .id();
+            (chain, bears)
+        });
+        let units = [
+            (ManaType::Red, r),
+            (ManaType::Green, g),
+            (ManaType::Colorless, c),
+        ]
+        .into_iter()
+        .flat_map(|(color, count)| std::iter::repeat_with(move || make_unit(color)).take(count))
+        .collect();
+        // One call fixes the favorable R-then-G-then-C slot order. These are
+        // fixture resources, not mana produced by the spell being paid for.
+        scenario.with_mana_pool(P0, units);
+        DjinnManamorphoseFixture {
+            runner: scenario.build(),
+            djinn,
+            spell,
+            food_chain,
+        }
+    }
+
+    fn multi_producer_djinn_manamorphose(r: usize, g: usize, c: usize) -> DjinnManamorphoseFixture {
+        let (mut scenario, djinn, spell) = djinn_manamorphose_board();
+        let mut producers = Vec::new();
+        for _ in 0..r {
+            producers.push((scenario.add_basic_land(P0, ManaColor::Red), ManaType::Red));
+        }
+        for _ in 0..g {
+            producers.push((
+                scenario.add_basic_land(P0, ManaColor::Green),
+                ManaType::Green,
+            ));
+        }
+        for _ in 0..c {
+            producers.push((
+                scenario
+                    .add_land_from_oracle(P0, "Wastes", "{T}: Add {C}.")
+                    .id(),
+                ManaType::Colorless,
+            ));
+        }
+        let mut runner = scenario.build();
+        for &(source, color) in &producers {
+            if color == ManaType::Colorless {
+                let object = runner.state_mut().objects.get_mut(&source).unwrap();
+                object
+                    .card_types
+                    .supertypes
+                    .push(crate::types::Supertype::Basic);
+                object.base_card_types = object.card_types.clone();
+            }
+        }
+        crate::game::layers::evaluate_layers(runner.state_mut());
+        assert!(runner.state().players[0].mana_pool.is_empty());
+        // CR 305.6 + CR 106.3 + CR 113.7: activate each particular real land's
+        // engine-authored action. Every pip keeps its actual producing object.
+        for (index, &(source, color)) in producers.iter().enumerate() {
+            let (_, _, grouped) = crate::ai_support::legal_actions_full(runner.state());
+            let action = grouped[&source]
+                .iter()
+                .find(|action| {
+                    matches!(action,
+                GameAction::TapLandForMana { selection }
+                    if selection.source.object_id == source && selection.mana_type == color)
+                })
+                .expect("the particular printed land offers its own mana action")
+                .clone();
+            runner.act(action).unwrap();
+            assert!(runner.state().objects[&source].tapped);
+            assert_eq!(runner.state().players[0].mana_pool.total(), index + 1);
+            assert_eq!(
+                runner.state().players[0]
+                    .mana_pool
+                    .units()
+                    .filter(|unit| unit.source_id == source && unit.color == color)
+                    .count(),
+                1
+            );
+        }
+        let units: Vec<_> = runner.state().players[0].mana_pool.units().collect();
+        assert_eq!(units.len(), producers.len());
+        let mut pips = HashSet::new();
+        for (unit, &(source, color)) in units.iter().zip(&producers) {
+            assert_eq!(unit.source_id, source);
+            assert_eq!(unit.color, color);
+            assert!(unit.pip_id.0 != 0 && pips.insert(unit.pip_id));
+            assert!(
+                unit.restrictions.is_empty() && unit.grants.is_empty() && unit.expiry.is_none()
+            );
+            assert!(unit.supertype.is_none() && !unit.source_could_produce_two_or_more_colors);
+        }
+        assert!(producers
+            .iter()
+            .all(|&(source, _)| runner.state().objects[&source].tapped));
+        assert!(
+            crate::game::mana_sources::activatable_mana_source_selections(runner.state(), P0)
+                .is_empty()
+        );
+        DjinnManamorphoseFixture {
+            runner,
+            djinn,
+            spell,
+            food_chain: None,
+        }
+    }
+
+    fn announce_manamorphose(fixture: &mut DjinnManamorphoseFixture, n: usize) -> ManaCost {
+        use crate::types::ability::{
+            AbilityCost, AdditionalCost, AdditionalCostOrigin, AdditionalCostRepeatability, Effect,
+            ManaProduction,
+        };
+        let runner = &mut fixture.runner;
+        let printed = crate::types::mana::parse_mtgjson_mana_cost("{1}{R/G}");
+        // Guard the real production and chained draw, rather than letting a
+        // strict-failure parse satisfy an unpayable-cost assertion.
+        let ability = &runner.state().objects[&fixture.spell].abilities[0];
+        assert!(matches!(
+            &*ability.effect,
+            Effect::Mana {
+                produced: ManaProduction::AnyCombination {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    ..
+                },
+                ..
+            }
+        ));
+        let draw = ability
+            .sub_ability
+            .as_ref()
+            .expect("Manamorphose must retain its draw");
+        assert!(matches!(
+            &*draw.effect,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+        assert!(draw.sub_ability.is_none());
+        assert_eq!(runner.state().objects[&fixture.spell].mana_cost, printed);
+        assert_eq!(
+            runner.state().objects[&fixture.djinn].mana_cost,
+            crate::types::mana::parse_mtgjson_mana_cost("{5}{U/R}{U/R}")
+        );
+        runner
+            .act(GameAction::CastSpell {
+                object_id: fixture.spell,
+                card_id: runner.state().objects[&fixture.spell].card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Manual,
+            })
+            .expect("the payable printed base must enter the real announcement");
+        // CR 702.56a + CR 702.56b + CR 601.2b + CR 601.2f: each declaration repeats the recipient's
+        // full printed cost, then decline the next offer before paying the total.
+        for paid in 0..n {
+            let WaitingFor::OptionalCostChoice {
+                player,
+                cost,
+                times_kicked,
+                origin,
+                pending_cast,
+                ..
+            } = &runner.state().waiting_for
+            else {
+                panic!(
+                    "expected P0 replicate offer, got {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            assert_eq!(*player, P0);
+            assert_eq!(*times_kicked, paid as u32);
+            assert_eq!(*origin, AdditionalCostOrigin::Replicate);
+            let instance = pending_cast
+                .additional_cost_queue
+                .first()
+                .expect("selected replicate instance");
+            assert_eq!(instance.origin, AdditionalCostOrigin::Replicate);
+            assert_eq!(instance.origin_ordinal, 0);
+            let AdditionalCost::Optional {
+                cost: AbilityCost::Mana { cost },
+                repeatability,
+            } = cost
+            else {
+                panic!("replicate must offer its mana cost");
+            };
+            assert_eq!(*repeatability, AdditionalCostRepeatability::Repeatable);
+            assert_eq!(*cost, printed);
+            runner
+                .act(GameAction::DecideOptionalCost { pay: paid + 1 < n })
+                .unwrap();
+        }
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ManaPayment { player: P0, .. }
+        ));
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::RedGreen; n],
+            generic: n as u32,
+        };
+        assert_eq!(runner.state().pending_cast.as_ref().unwrap().cost, cost);
+        assert!(runner.state().stack.is_empty());
+        cost
+    }
+
+    fn activate_food_chain_for_manamorphose(
+        fixture: &mut DjinnManamorphoseFixture,
+    ) -> Vec<ManaUnitFingerprint> {
+        use crate::types::game_state::{ManaChoice, ManaChoicePrompt, PayCostKind};
+        let (chain, bears) = fixture.food_chain.unwrap();
+        let runner = &mut fixture.runner;
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ManaPayment { player: P0, .. }
+        ));
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: chain,
+                ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .unwrap();
+        let WaitingFor::PayCost {
+            player,
+            kind: PayCostKind::ExileFromManaZone { zone },
+            choices,
+            count,
+            ..
+        } = &runner.state().waiting_for
+        else {
+            panic!(
+                "Food Chain must ask for a real exile cost, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(*zone, Zone::Battlefield);
+        assert_eq!(*count, 1);
+        assert_eq!(choices.len(), 2);
+        assert!(choices.contains(&bears) && choices.contains(&fixture.djinn));
+        runner
+            .act(GameAction::SelectCards { cards: vec![bears] })
+            .unwrap();
+        let WaitingFor::ChooseManaColor {
+            player,
+            choice: ManaChoicePrompt::SingleColor { options },
+            ..
+        } = &runner.state().waiting_for
+        else {
+            panic!(
+                "Food Chain must ask its producer's color, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(options.len(), 5);
+        assert!(options.contains(&ManaType::Red));
+        runner
+            .act(GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(ManaType::Red),
+                count: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ManaPayment { player: P0, .. }
+        ));
+        // CR 106.3 + CR 106.6: MV two Bears gives three creature-only units;
+        // the instant cannot spend them, even though they increase raw total.
+        assert_eq!(runner.state().objects[&bears].zone, Zone::Exile);
+        assert_eq!(
+            runner.state().objects[&fixture.djinn].zone,
+            Zone::Battlefield
+        );
+        assert_eq!(runner.state().objects[&fixture.djinn].power, Some(3));
+        assert_eq!(runner.state().objects[&fixture.djinn].toughness, Some(5));
+        let meta =
+            crate::game::casting::build_spell_meta(runner.state(), P0, fixture.spell).unwrap();
+        let context = PaymentContext::Spell(&meta);
+        let pool = &runner.state().players[0].mana_pool;
+        assert_eq!(
+            pool.count_where(|unit| spell_permits_unit(Some(&context), unit)),
+            pool.total() - 3
+        );
+        let chain_units: Vec<_> = runner.state().players[0]
+            .mana_pool
+            .units()
+            .filter(|unit| unit.source_id == chain)
+            .collect();
+        assert_eq!(chain_units.len(), 3);
+        assert_eq!(
+            chain_units
+                .iter()
+                .map(|unit| unit.pip_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        assert!(chain_units.iter().all(|unit| unit.pip_id.0 != 0
+            && unit.color == ManaType::Red
+            && !unit.restrictions.is_empty()
+            && !spell_permits_unit(Some(&context), &unit.clone().into_shape_and_pip().0)));
+        fingerprint(&chain_units)
+    }
+
+    fn begin_hybrid_work(
+        label: &'static str,
+        entry_clone_limit: usize,
+        payment_clone_limit: usize,
+    ) {
+        HYBRID_PAYMENT_WORK.with_borrow_mut(|work| {
+            assert!(work.is_none());
+            *work = Some(HybridPaymentWork {
+                label,
+                entry_clone_limit,
+                payment_clone_limit,
+                reductions: Vec::new(),
+                selectors: Vec::new(),
+                current_reduction: None,
+                current_selector: None,
+            });
+        });
+    }
+
+    fn take_hybrid_work() -> HybridPaymentWork {
+        let work = HYBRID_PAYMENT_WORK.with_borrow_mut(|work| work.take().unwrap());
+        assert!(work.current_reduction.is_none() && work.current_selector.is_none());
+        eprintln!("hybrid WORK {}: {work:?}", work.label);
+        work
+    }
+
+    fn finish_payable_manamorphose(
+        fixture: &mut DjinnManamorphoseFixture,
+        n: usize,
+        cost: &ManaCost,
+    ) {
+        use crate::types::ability::AdditionalCostOrigin;
+        let before = fingerprint(
+            &fixture.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        begin_hybrid_work("public payable PassPriority", 0, n);
+        fixture.runner.act(GameAction::PassPriority).unwrap();
+        let work = take_hybrid_work();
+        assert!(work.reductions.iter().any(|root| root.cost == *cost
+            && !root.fundable
+            && root.residual == Some(ManaCost::NoCost)));
+        assert!(work.reductions.iter().all(|root| !root.fundable
+            && root.requests == 0
+            && root.entry_clones == 0
+            && root.alternative_entries == 0
+            && root.alternative_clones == 0));
+        assert!(!work.selectors.is_empty());
+        for attempt in &work.selectors {
+            assert_eq!(attempt.cost, *cost);
+            assert_eq!(attempt.next_position, 0);
+            assert!(attempt.label.starts_with("selector"));
+            assert!(
+                attempt.entries > 0
+                    && attempt.alternative_clones > 0
+                    && attempt.alternative_clones <= n
+            );
+        }
+        let state = fixture.runner.state();
+        // CR 118.3a + CR 601.2h: the cast spends exactly its locked total;
+        // every remaining pip is an unchanged original actual unit.
+        assert_eq!(state.objects[&fixture.spell].zone, Zone::Stack);
+        assert!(state
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == fixture.spell));
+        assert_eq!(
+            state.objects[&fixture.spell].mana_spent_to_cast_amount,
+            (2 * n) as u32
+        );
+        let records = &state.objects[&fixture.spell].additional_cost_payments;
+        if n == 1 {
+            assert!(records.is_empty());
+        } else {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].origin, AdditionalCostOrigin::Replicate);
+            assert_eq!(records[0].origin_ordinal, 0);
+            assert_eq!(records[0].count, (n - 1) as u32);
+        }
+        let after = fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>());
+        assert_eq!(after.len(), before.len() - 2 * n);
+        assert!(after.iter().all(|unit| before.contains(unit)));
+        assert!(state.pending_cast.is_none() && state.active_payment_pins.is_empty());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    fn assert_refused_manamorphose(
+        fixture: &DjinnManamorphoseFixture,
+        cost: &ManaCost,
+        before: &[ManaUnitFingerprint],
+    ) {
+        let state = fixture.runner.state();
+        // CR 601.2h: a refused final payment must not spend a partial cost.
+        assert_eq!(
+            fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>()),
+            before
+        );
+        assert!(state.stack.is_empty());
+        assert_eq!(state.objects[&fixture.spell].zone, Zone::Hand);
+        assert_eq!(state.objects[&fixture.spell].mana_spent_to_cast_amount, 0);
+        assert!(!state.objects[&fixture.spell].mana_spent_to_cast);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ManaPayment { player: P0, .. }
+        ));
+        assert_eq!(state.pending_cast.as_ref().unwrap().cost, *cost);
+        assert!(state.active_payment_pins.is_empty());
+    }
+
+    fn assert_unpayable_reducer_work(
+        work: &HybridPaymentWork,
+        cost: &ManaCost,
+        residual: ManaCost,
+        b: usize,
+        reuse: bool,
+    ) {
+        assert!(work
+            .reductions
+            .iter()
+            .any(|root| !root.fundable && root.cost == *cost));
+        let roots: Vec<_> = work
+            .reductions
+            .iter()
+            .filter(|root| root.fundable)
+            .collect();
+        assert!(
+            !roots.is_empty(),
+            "actual public action must reach the fundable reducer before any later selector"
+        );
+        for root in roots {
+            assert_eq!(root.cost, *cost);
+            assert_eq!(root.residual, Some(residual.clone()));
+            assert!(root.requests > 0 && root.entry_clones > 0 && root.alternative_entries > 0);
+            assert!(
+                root.entry_clones <= b
+                    && root.requests <= 1 + 3 * b
+                    && root.alternative_clones <= 2 * b
+            );
+            if reuse {
+                assert!(root.reuse > 0, "equivalent exact residuals must be reused");
+            }
+        }
+        // Downstream attempts are recorded individually; their presence is not
+        // required when an earlier public planner/payment stage refuses.
+        for attempt in &work.selectors {
+            assert_eq!(attempt.cost, *cost);
+        }
+    }
+
+    fn supplement_manamorphose_selector(
+        fixture: &DjinnManamorphoseFixture,
+        cost: &ManaCost,
+        clone_limit: usize,
+        expect_reuse: bool,
+    ) {
+        let state = fixture.runner.state();
+        let meta = crate::game::casting::build_spell_meta(state, P0, fixture.spell).unwrap();
+        let context = PaymentContext::Spell(&meta);
+        let permissions =
+            crate::game::static_abilities::build_cost_permission_context(state, P0, None);
+        assert!(permissions.mana_spend_permission.is_none() && permissions.life_colors.is_empty());
+        begin_hybrid_work(
+            "supplementary exact announced-cost selector",
+            0,
+            clone_limit,
+        );
+        assert_eq!(
+            select_mana_payment_with_life_budget(
+                &state.players[0].mana_pool,
+                cost,
+                None,
+                Some(&context),
+                permissions.mana_spend_permission,
+                None,
+                permissions.life_colors,
+                &[],
+                Some(permissions.max_life as usize)
+            ),
+            Err(PaymentError::InsufficientMana)
+        );
+        let work = take_hybrid_work();
+        assert!(work.reductions.is_empty());
+        assert_eq!(work.selectors.len(), 1);
+        let attempt = &work.selectors[0];
+        assert_eq!(attempt.cost, *cost);
+        assert_eq!(attempt.next_position, 0);
+        assert!(attempt.entries > 0);
+        assert!(attempt.alternative_clones <= clone_limit);
+        if expect_reuse {
+            assert!(attempt.failed_key_hits > 0 && attempt.alternative_clones > 0);
+            assert_eq!(attempt.count_rejections, 0);
+        } else {
+            assert!(attempt.count_rejections > 0);
+            assert_eq!(attempt.alternative_clones, 0);
+        }
+    }
+
+    fn cancel_manamorphose(fixture: &mut DjinnManamorphoseFixture) {
+        fixture.runner.act(GameAction::CancelCast).unwrap();
+        assert!(
+            fixture.runner.state().stack.is_empty()
+                && fixture.runner.state().pending_cast.is_none()
+        );
+        assert!(matches!(
+            fixture.runner.state().waiting_for,
+            WaitingFor::Priority { player: P0, .. }
+        ));
+    }
+
+    #[test]
+    fn djinn_manamorphose_payable_repeatable_hybrids_have_bounded_work_homogeneous_n4() {
+        let mut ordinary = homogeneous_djinn_manamorphose(2, 2, 4, false);
+        let cost = announce_manamorphose(&mut ordinary, 4);
+        finish_payable_manamorphose(&mut ordinary, 4, &cost);
+
+        let mut decline = homogeneous_djinn_manamorphose(1, 0, 1, false);
+        let cost = announce_manamorphose(&mut decline, 1);
+        finish_payable_manamorphose(&mut decline, 1, &cost);
+
+        let mut restricted = homogeneous_djinn_manamorphose(2, 2, 4, true);
+        let cost = announce_manamorphose(&mut restricted, 4);
+        let chain = activate_food_chain_for_manamorphose(&mut restricted);
+        finish_payable_manamorphose(&mut restricted, 4, &cost);
+        let remainder = fingerprint(
+            &restricted.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(remainder.len(), 3);
+        assert!(chain.iter().all(|unit| remainder.contains(unit)));
+
+        let mut pinned = homogeneous_djinn_manamorphose(2, 2, 5, true);
+        let cost = announce_manamorphose(&mut pinned, 4);
+        let pin = pinned.runner.state().players[0]
+            .mana_pool
+            .units()
+            .filter(|unit| unit.color == ManaType::Colorless)
+            .last()
+            .unwrap()
+            .pip_id;
+        let chain = activate_food_chain_for_manamorphose(&mut pinned);
+        pinned
+            .runner
+            .act(GameAction::SpendPoolMana { pip_id: pin })
+            .unwrap();
+        assert_eq!(
+            pinned
+                .runner
+                .state()
+                .pending_cast
+                .as_ref()
+                .unwrap()
+                .pinned_pool_units,
+            vec![pin]
+        );
+        finish_payable_manamorphose(&mut pinned, 4, &cost);
+        // CR 106.4a + CR 118.3a: retain excess and all ineligible units, while
+        // honoring the exact public pin rather than ManaUnit's pip-blind Eq.
+        let remainder = fingerprint(
+            &pinned.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert!(!remainder.iter().any(|unit| unit.pip_id == pin));
+        assert_eq!(
+            remainder
+                .iter()
+                .filter(|unit| unit.color == ManaType::Colorless && unit.restrictions.is_empty())
+                .count(),
+            1
+        );
+        assert!(chain.iter().all(|unit| remainder.contains(unit)));
+    }
+
+    #[test]
+    fn djinn_manamorphose_payable_repeatable_hybrids_have_bounded_work_homogeneous_n8() {
+        let mut fixture = homogeneous_djinn_manamorphose(4, 4, 8, false);
+        let cost = announce_manamorphose(&mut fixture, 8);
+        finish_payable_manamorphose(&mut fixture, 8, &cost);
+    }
+
+    #[test]
+    fn djinn_manamorphose_payable_repeatable_hybrids_have_bounded_work_multi_producer_n8() {
+        let mut fixture = multi_producer_djinn_manamorphose(4, 4, 8);
+        let cost = announce_manamorphose(&mut fixture, 8);
+        finish_payable_manamorphose(&mut fixture, 8, &cost);
+        assert!(fixture.runner.state().players[0].mana_pool.is_empty());
+    }
+
+    #[test]
+    fn djinn_manamorphose_failing_generic_suffix_is_rejected_with_bounded_work_homogeneous_n4() {
+        let mut payable = homogeneous_djinn_manamorphose(2, 2, 4, false);
+        let cost = announce_manamorphose(&mut payable, 4);
+        finish_payable_manamorphose(&mut payable, 4, &cost);
+
+        let mut short = homogeneous_djinn_manamorphose(2, 2, 3, false);
+        let cost = announce_manamorphose(&mut short, 4);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        begin_hybrid_work("public generic-short homogeneous n4", 45, 0);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            45,
+            true,
+        );
+        supplement_manamorphose_selector(&short, &cost, 0, false);
+        cancel_manamorphose(&mut short);
+
+        // Keep all Food Chain operations after this body's designated public
+        // B+1 discriminator and supplement, including on the bfd36 comparison.
+        let mut chain_payable = homogeneous_djinn_manamorphose(2, 2, 4, true);
+        let cost = announce_manamorphose(&mut chain_payable, 4);
+        let produced = activate_food_chain_for_manamorphose(&mut chain_payable);
+        finish_payable_manamorphose(&mut chain_payable, 4, &cost);
+        let remainder = fingerprint(
+            &chain_payable.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert!(produced.iter().all(|unit| remainder.contains(unit)));
+
+        let mut chain_short = homogeneous_djinn_manamorphose(2, 2, 3, true);
+        let cost = announce_manamorphose(&mut chain_short, 4);
+        activate_food_chain_for_manamorphose(&mut chain_short);
+        let before = fingerprint(
+            &chain_short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert!(before.len() >= 8);
+        begin_hybrid_work("public Food Chain generic-short n4", 121, 0);
+        assert!(chain_short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&chain_short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            121,
+            false,
+        );
+        assert!(work
+            .reductions
+            .iter()
+            .filter(|root| root.fundable)
+            .all(|root| root.requests <= 121
+                && root.entry_clones <= 121
+                && root.alternative_clones <= 80));
+        supplement_manamorphose_selector(&chain_short, &cost, 0, false);
+        cancel_manamorphose(&mut chain_short);
+        let (chain, bears) = chain_short.food_chain.unwrap();
+        assert_eq!(chain_short.runner.state().objects[&bears].zone, Zone::Exile);
+        assert_eq!(
+            chain_short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .filter(|unit| unit.source_id == chain)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn djinn_manamorphose_failing_generic_suffix_is_rejected_with_bounded_work_homogeneous_n8() {
+        let mut payable = homogeneous_djinn_manamorphose(4, 4, 8, false);
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = homogeneous_djinn_manamorphose(4, 4, 7, false);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        begin_hybrid_work("public generic-short homogeneous n8", 225, 0);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            225,
+            true,
+        );
+        supplement_manamorphose_selector(&short, &cost, 0, false);
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_failing_generic_suffix_is_rejected_with_bounded_work_multi_producer_n8() {
+        let mut payable = multi_producer_djinn_manamorphose(4, 4, 8);
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = multi_producer_djinn_manamorphose(4, 4, 7);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        begin_hybrid_work("public generic-short multi-producer n8", 225, 0);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            225,
+            true,
+        );
+        supplement_manamorphose_selector(&short, &cost, 0, false);
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_equivalent_hybrid_failures_are_reused_homogeneous_n8() {
+        let mut payable = homogeneous_djinn_manamorphose(4, 4, 8, false);
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = homogeneous_djinn_manamorphose(4, 3, 9, false);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 16);
+        begin_hybrid_work("public hybrid-short homogeneous n8", 180, 80);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::RedGreen],
+                generic: 0,
+            },
+            180,
+            true,
+        );
+        supplement_manamorphose_selector(&short, &cost, 80, true);
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_equivalent_hybrid_failures_are_reused_multi_producer_n8() {
+        let mut payable = multi_producer_djinn_manamorphose(4, 4, 8);
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = multi_producer_djinn_manamorphose(4, 3, 9);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 16);
+        begin_hybrid_work("public hybrid-short multi-producer n8", 180, 80);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::RedGreen],
+                generic: 0,
+            },
+            180,
+            true,
+        );
+        supplement_manamorphose_selector(&short, &cost, 80, true);
+        cancel_manamorphose(&mut short);
     }
 
     #[test]
