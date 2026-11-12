@@ -5017,7 +5017,7 @@ mod tests {
 
     use crate::game::scenario::{GameRunner, GameScenario, P0};
     use crate::types::actions::GameAction;
-    use crate::types::game_state::{CastPaymentMode, WaitingFor};
+    use crate::types::game_state::{CastPaymentMode, StackEntry, WaitingFor};
 
     struct DjinnManamorphoseFixture {
         runner: GameRunner,
@@ -5165,6 +5165,28 @@ mod tests {
         }
     }
 
+    fn assert_uncommitted_manamorphose_announcement(fixture: &DjinnManamorphoseFixture) {
+        use crate::types::game_state::{CastingVariant, StackEntryKind};
+        let state = fixture.runner.state();
+        // CR 601.2a + CR 601.2i: the proposed spell is already on the stack;
+        // it becomes cast only after the casting steps, including payment, finish.
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(
+            state.stack[0],
+            StackEntry {
+                id: fixture.spell,
+                source_id: fixture.spell,
+                controller: P0,
+                kind: StackEntryKind::Spell {
+                    card_id: state.objects[&fixture.spell].card_id,
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            }
+        );
+    }
+
     fn announce_manamorphose(fixture: &mut DjinnManamorphoseFixture, n: usize) -> ManaCost {
         use crate::types::ability::{
             AbilityCost, AdditionalCost, AdditionalCostOrigin, AdditionalCostRepeatability, Effect,
@@ -5258,7 +5280,13 @@ mod tests {
             generic: n as u32,
         };
         assert_eq!(runner.state().pending_cast.as_ref().unwrap().cost, cost);
-        assert!(runner.state().stack.is_empty());
+        assert_eq!(runner.state().objects[&fixture.spell].zone, Zone::Hand);
+        assert_eq!(
+            runner.state().objects[&fixture.spell].mana_spent_to_cast_amount,
+            0
+        );
+        assert!(!runner.state().objects[&fixture.spell].mana_spent_to_cast);
+        assert_uncommitted_manamorphose_announcement(fixture);
         cost
     }
 
@@ -5454,6 +5482,7 @@ mod tests {
         fixture: &DjinnManamorphoseFixture,
         cost: &ManaCost,
         before: &[ManaUnitFingerprint],
+        stack_before: &im::Vector<StackEntry>,
     ) {
         let state = fixture.runner.state();
         // CR 601.2h: a refused final payment must not spend a partial cost.
@@ -5461,7 +5490,8 @@ mod tests {
             fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>()),
             before
         );
-        assert!(state.stack.is_empty());
+        assert_uncommitted_manamorphose_announcement(fixture);
+        assert_eq!(&state.stack, stack_before);
         assert_eq!(state.objects[&fixture.spell].zone, Zone::Hand);
         assert_eq!(state.objects[&fixture.spell].mana_spent_to_cast_amount, 0);
         assert!(!state.objects[&fixture.spell].mana_spent_to_cast);
@@ -5669,10 +5699,11 @@ mod tests {
                 .units()
                 .collect::<Vec<_>>(),
         );
+        let stack_before = short.runner.state().stack.clone();
         begin_hybrid_work("public generic-short homogeneous n4", 45, 0);
         assert!(short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&short, &cost, &before);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
@@ -5710,10 +5741,11 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert!(before.len() >= 8);
+        let stack_before = chain_short.runner.state().stack.clone();
         begin_hybrid_work("public Food Chain generic-short n4", 121, 0);
         assert!(chain_short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&chain_short, &cost, &before);
+        assert_refused_manamorphose(&chain_short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
@@ -5759,10 +5791,11 @@ mod tests {
                 .units()
                 .collect::<Vec<_>>(),
         );
+        let stack_before = short.runner.state().stack.clone();
         begin_hybrid_work("public generic-short homogeneous n8", 225, 0);
         assert!(short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&short, &cost, &before);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
@@ -5791,10 +5824,11 @@ mod tests {
                 .units()
                 .collect::<Vec<_>>(),
         );
+        let stack_before = short.runner.state().stack.clone();
         begin_hybrid_work("public generic-short multi-producer n8", 225, 0);
         assert!(short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&short, &cost, &before);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
@@ -5824,10 +5858,11 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(before.len(), 16);
+        let stack_before = short.runner.state().stack.clone();
         begin_hybrid_work("public hybrid-short homogeneous n8", 180, 80);
         assert!(short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&short, &cost, &before);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
@@ -5857,10 +5892,11 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(before.len(), 16);
+        let stack_before = short.runner.state().stack.clone();
         begin_hybrid_work("public hybrid-short multi-producer n8", 180, 80);
         assert!(short.runner.act(GameAction::PassPriority).is_err());
         let work = take_hybrid_work();
-        assert_refused_manamorphose(&short, &cost, &before);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         assert_unpayable_reducer_work(
             &work,
             &cost,
