@@ -1320,14 +1320,58 @@ impl PaymentClasses {
         }
     }
 
-    fn ordered_pool(&mut self, pool: &ManaPool) -> Vec<usize> {
+    fn pool_key(&mut self, pool: &ManaPool, pins: &[ManaPipId]) -> PaymentPoolKey {
+        let mut counts: Vec<(usize, usize)> = Vec::new();
+        for (shape, count) in pool.shapes() {
+            let ordinal = self.ordinal(shape);
+            if let Some((_, total)) = counts.iter_mut().find(|(class, _)| *class == ordinal) {
+                *total += count;
+            } else if count > 0 {
+                counts.push((ordinal, count));
+            }
+        }
+        counts.sort_unstable();
+        let mut pinned = Vec::new();
+        if !pins.is_empty() {
+            for unit in pool.units() {
+                let (shape, pip) = unit.into_shape_and_pip();
+                if pins.contains(&pip) {
+                    pinned.push((self.ordinal(&shape), pip));
+                }
+            }
+            pinned.sort_unstable();
+        }
+        PaymentPoolKey {
+            counts,
+            pinned,
+            ordered: None,
+        }
+    }
+
+    fn ordered_pool(
+        &mut self,
+        pool: &ManaPool,
+        pins: &[ManaPipId],
+    ) -> Vec<(usize, Option<ManaPipId>)> {
         pool.units()
-            .map(|unit| self.ordinal(&unit.into_shape_and_pip().0))
+            .map(|unit| {
+                let (shape, pip) = unit.into_shape_and_pip();
+                (self.ordinal(&shape), pins.contains(&pip).then_some(pip))
+            })
             .collect()
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+/// Sparse append-only class ordinals do not encode dictionary growth. Order is
+/// retained only when the continuation can observe slot-first spending.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct PaymentPoolKey {
+    counts: Vec<(usize, usize)>,
+    pinned: Vec<(usize, ManaPipId)>,
+    ordered: Option<Vec<(usize, Option<ManaPipId>)>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct FailedPaymentKey {
     next_position: usize,
     colors: (ManaType, ManaType),
@@ -1335,7 +1379,7 @@ struct FailedPaymentKey {
     choice_cursor: usize,
     max_life_payments: Option<usize>,
     preferred_hybrid_colors: Vec<(ManaType, ManaType, ManaType)>,
-    pool: Vec<(usize, Option<ManaPipId>)>,
+    pool: PaymentPoolKey,
 }
 
 /// One immutable-context proof only; successful branches are never cached.
@@ -1356,10 +1400,17 @@ impl FailedPaymentStates {
         choice_cursor: usize,
         preferences: &[(ManaType, ManaType, ManaType)],
         max_life_payments: Option<usize>,
+        spell: Option<&PaymentContext<'_>>,
+        mana_spend_permission: Option<ManaSpendPermission>,
+        life_colors: crate::types::mana::LifePaymentColors,
     ) -> FailedPaymentKey {
         let classes = self
             .classes
             .get_or_insert_with(|| PaymentClasses::from_pool(pool));
+        let mut pool_key = classes.pool_key(pool, pins);
+        if !continuation.pool_order_is_irrelevant(spell, mana_spend_permission, Some(life_colors)) {
+            pool_key.ordered = Some(classes.ordered_pool(pool, pins));
+        }
         FailedPaymentKey {
             next_position: continuation.next_position,
             colors,
@@ -1367,16 +1418,7 @@ impl FailedPaymentStates {
             choice_cursor,
             max_life_payments,
             preferred_hybrid_colors: preferences.to_vec(),
-            pool: pool
-                .units()
-                .map(|unit| {
-                    let (shape, pip) = unit.into_shape_and_pip();
-                    (
-                        classes.ordinal(&shape),
-                        (pip.0 != 0 && pins.contains(&pip)).then_some(pip),
-                    )
-                })
-                .collect(),
+            pool: pool_key,
         }
     }
 }
@@ -1385,7 +1427,7 @@ impl FailedPaymentStates {
 struct HybridResidualKey {
     next_position: usize,
     quality_demand: SourceQualityDemand,
-    pool: Vec<usize>,
+    pool: PaymentPoolKey,
     unpaid_gaps: Vec<Vec<ManaCostShard>>,
 }
 
@@ -1413,7 +1455,16 @@ impl HybridResidualMemo {
         pool: &ManaPool,
         continuation: PaymentContinuation<'_>,
         prefix: &[Option<ManaCostShard>],
+        spell: Option<&PaymentContext<'_>>,
+        mana_spend_permission: Option<ManaSpendPermission>,
+        demand: Option<&ColorDemand>,
     ) -> HybridResidualKey {
+        let mut pool_key = self.classes.pool_key(pool, &[]);
+        if !continuation.pool_order_is_irrelevant(spell, mana_spend_permission, None)
+            || continuation.has_mixed_demanded_color(pool, spell, demand)
+        {
+            pool_key.ordered = Some(self.classes.ordered_pool(pool, &[]));
+        }
         // Future raw indices separate gaps. Paid prefix slots disappear only
         // inside their gap, so every future continuation flattens identically.
         let mut unpaid_gaps = vec![Vec::new()];
@@ -1427,13 +1478,98 @@ impl HybridResidualMemo {
         HybridResidualKey {
             next_position: continuation.next_position,
             quality_demand: continuation.quality_demand,
-            pool: self.classes.ordered_pool(pool),
+            pool: pool_key,
             unpaid_gaps,
         }
     }
 }
 
 impl PaymentContinuation<'_> {
+    /// CR 106.6 + CR 107.4b + CR 107.4e + CR 107.4f + CR 107.4h:
+    /// ordinary type payments followed by
+    /// unrestricted generic payment cannot distinguish same-type eligible
+    /// units. Quality, two-generic and restricted-X stages can observe order.
+    fn pool_order_is_irrelevant(
+        self,
+        spell: Option<&PaymentContext<'_>>,
+        mana_spend_permission: Option<ManaSpendPermission>,
+        life_colors: Option<crate::types::mana::LifePaymentColors>,
+    ) -> bool {
+        if self.quality_demand != SourceQualityDemand::default()
+            || mana_spend_permission.is_some()
+            || matches!(spell, Some(PaymentContext::Spell(meta))
+                if meta.spend_only_on_x_colors.is_some()
+                    && self.generic.min(meta.spend_only_on_x_generic_count) > 0)
+        {
+            return false;
+        }
+        self.order[self.next_position..].iter().all(|&index| {
+            let requirement = shard_to_mana_type(self.shards[index]);
+            let requirement = match life_colors {
+                Some(colors) => effective_shard_requirement(requirement, colors),
+                None => requirement,
+            };
+            match requirement {
+                ShardRequirement::Single(_)
+                | ShardRequirement::Hybrid(_, _)
+                | ShardRequirement::ColorlessHybrid(_)
+                | ShardRequirement::Phyrexian(_)
+                | ShardRequirement::HybridPhyrexian(_, _)
+                | ShardRequirement::X => true,
+                ShardRequirement::Snow
+                | ShardRequirement::TwoOrMoreColorSource
+                | ShardRequirement::TwoGenericHybrid(_)
+                | ShardRequirement::TwoGenericHybridPhyrexian(_) => false,
+            }
+        })
+    }
+
+    /// CR 118.10 + CR 702.51a: a hard outer reserve distinguishes a real
+    /// colored unit from an eligible convoke stand-in of that same color.
+    /// Soft hand demand in the payer is not this reserve.
+    fn has_mixed_demanded_color(
+        self,
+        pool: &ManaPool,
+        spell: Option<&PaymentContext<'_>>,
+        demand: Option<&ColorDemand>,
+    ) -> bool {
+        let Some(demand) = demand.filter(|_| self.generic > 0) else {
+            return false;
+        };
+        [
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Green,
+        ]
+        .into_iter()
+        .zip(demand)
+        .any(|(color, &reserved)| {
+            reserved > 0
+                && pool.count_where(|unit| {
+                    is_eligible_color_unit(unit, color, spell) && unit.is_convoke_payment()
+                }) > 0
+                && pool.count_where(|unit| {
+                    is_eligible_color_unit(unit, color, spell) && !unit.is_convoke_payment()
+                }) > 0
+                && self.order[self.next_position..].iter().any(|&index| {
+                    match shard_to_mana_type(self.shards[index]) {
+                        ShardRequirement::Single(required)
+                        | ShardRequirement::Phyrexian(required) => required == color,
+                        ShardRequirement::Hybrid(a, b)
+                        | ShardRequirement::HybridPhyrexian(a, b) => a == color || b == color,
+                        ShardRequirement::ColorlessHybrid(required) => required == color,
+                        ShardRequirement::Snow
+                        | ShardRequirement::TwoOrMoreColorSource
+                        | ShardRequirement::TwoGenericHybrid(_)
+                        | ShardRequirement::TwoGenericHybridPhyrexian(_)
+                        | ShardRequirement::X => false,
+                    }
+                })
+        })
+    }
+
     /// CR 107.4b + CR 107.4e + CR 107.4f + CR 118.3 + CR 118.10: a necessary mana count,
     /// including this mana-paid hybrid. Automatic life choices need no mana.
     /// Eligibility, exact colors, Snow, Z, pins and life still use the payer.
@@ -1574,6 +1710,9 @@ impl PaymentContinuation<'_> {
                 choice_cursor,
                 preferred_hybrid_colors,
                 max_life_payments,
+                spell,
+                mana_spend_permission,
+                life_colors,
             )
         });
         if key
@@ -1633,6 +1772,9 @@ impl PaymentContinuation<'_> {
                     choice_cursor,
                     preferred_hybrid_colors,
                     max_life_payments,
+                    spell,
+                    mana_spend_permission,
+                    life_colors,
                 )
             });
             failed_states.failed.insert(key);
@@ -2001,9 +2143,16 @@ fn reduce_cost_by_pool_from(
     if fundable.is_some() {
         record_hybrid_work(HybridWorkEvent::ReducerRequest);
     }
-    let key = memo
-        .as_mut()
-        .map(|memo| memo.key(pool, continuation, residual_prefix));
+    let key = memo.as_mut().map(|memo| {
+        memo.key(
+            pool,
+            continuation,
+            residual_prefix,
+            spell,
+            mana_spend_permission,
+            demand,
+        )
+    });
     if let Some(result) = memo
         .as_ref()
         .zip(key.as_ref())
@@ -5081,24 +5230,32 @@ mod tests {
     }
 
     fn multi_producer_djinn_manamorphose(r: usize, g: usize, c: usize) -> DjinnManamorphoseFixture {
+        let order: Vec<_> = [
+            (ManaType::Red, r),
+            (ManaType::Green, g),
+            (ManaType::Colorless, c),
+        ]
+        .into_iter()
+        .flat_map(|(color, count)| std::iter::repeat_n(color, count))
+        .collect();
+        ordered_multi_producer_djinn_manamorphose(&order)
+    }
+
+    fn ordered_multi_producer_djinn_manamorphose(order: &[ManaType]) -> DjinnManamorphoseFixture {
         let (mut scenario, djinn, spell) = djinn_manamorphose_board();
         let mut producers = Vec::new();
-        for _ in 0..r {
-            producers.push((scenario.add_basic_land(P0, ManaColor::Red), ManaType::Red));
-        }
-        for _ in 0..g {
-            producers.push((
-                scenario.add_basic_land(P0, ManaColor::Green),
-                ManaType::Green,
-            ));
-        }
-        for _ in 0..c {
-            producers.push((
-                scenario
+        for &color in order {
+            let source = match color {
+                ManaType::Red => scenario.add_basic_land(P0, ManaColor::Red),
+                ManaType::Green => scenario.add_basic_land(P0, ManaColor::Green),
+                ManaType::Colorless => scenario
                     .add_land_from_oracle(P0, "Wastes", "{T}: Add {C}.")
                     .id(),
-                ManaType::Colorless,
-            ));
+                ManaType::White | ManaType::Blue | ManaType::Black => {
+                    panic!("this real-land fixture uses only Mountain, Forest and Wastes")
+                }
+            };
+            producers.push((source, color));
         }
         let mut runner = scenario.build();
         for &(source, color) in &producers {
@@ -5918,6 +6075,244 @@ mod tests {
         cancel_manamorphose(&mut short);
     }
 
+    const INTERLEAVED_GENERIC_SHORT: [ManaType; 15] = {
+        use ManaType::{Colorless as C, Green as G, Red as R};
+        [C, C, R, C, R, C, G, G, G, C, G, R, C, R, C]
+    };
+    const INTERLEAVED_HYBRID_SHORT: [ManaType; 16] = {
+        use ManaType::{Colorless as C, Green as G, Red as R};
+        [C, C, G, C, C, G, C, C, R, R, C, R, R, C, G, C]
+    };
+
+    fn interleaved_generic_payable_order() -> Vec<ManaType> {
+        let mut order = INTERLEAVED_GENERIC_SHORT.to_vec();
+        order.push(ManaType::Colorless);
+        order
+    }
+
+    fn interleaved_hybrid_payable_order() -> Vec<ManaType> {
+        let mut order = INTERLEAVED_HYBRID_SHORT.to_vec();
+        *order.last_mut().unwrap() = ManaType::Green;
+        order
+    }
+
+    fn assert_payable_manamorphose_selector(fixture: &DjinnManamorphoseFixture, cost: &ManaCost) {
+        let state = fixture.runner.state();
+        let meta = crate::game::casting::build_spell_meta(state, P0, fixture.spell).unwrap();
+        let context = PaymentContext::Spell(&meta);
+        let permissions =
+            crate::game::static_abilities::build_cost_permission_context(state, P0, None);
+        assert!(permissions.mana_spend_permission.is_none() && permissions.life_colors.is_empty());
+        let before = fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>());
+        begin_hybrid_work("independent payable announced-cost selector", 0, 8);
+        let (spent, life) = select_mana_payment_with_life_budget(
+            &state.players[0].mana_pool,
+            cost,
+            None,
+            Some(&context),
+            permissions.mana_spend_permission,
+            None,
+            permissions.life_colors,
+            &[],
+            Some(permissions.max_life as usize),
+        )
+        .expect("the paired publicly announced cost is affordable");
+        let work = take_hybrid_work();
+        assert!(work.reductions.is_empty());
+        assert_eq!(work.selectors.len(), 1);
+        let attempt = &work.selectors[0];
+        assert_eq!(attempt.cost, *cost);
+        assert_eq!(attempt.next_position, 0);
+        assert!(attempt.entries > 0 && attempt.alternative_clones > 0);
+        assert!(attempt.alternative_clones <= 8);
+        assert_eq!(attempt.count_rejections, 0);
+        // CR 118.3a + CR 118.10: selection returns sixteen distinct actual
+        // units without spending or transferring any unit's provenance.
+        assert_eq!(spent.len(), 16);
+        assert!(life.is_empty());
+        let mut available = before.clone();
+        for unit in fingerprint(&spent) {
+            let index = available
+                .iter()
+                .position(|original| *original == unit)
+                .unwrap();
+            available.remove(index);
+        }
+        assert_eq!(
+            fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>()),
+            before
+        );
+    }
+
+    #[test]
+    fn djinn_manamorphose_failing_generic_suffix_is_rejected_with_bounded_work_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_generic_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_GENERIC_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 15);
+        let stack_before = short.runner.state().stack.clone();
+        begin_hybrid_work("public generic-short interleaved n8", 225, 0);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            225,
+            true,
+        );
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_equivalent_hybrid_failures_are_reused_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_hybrid_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_HYBRID_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 16);
+        let stack_before = short.runner.state().stack.clone();
+        begin_hybrid_work("public hybrid-short interleaved n8", 180, 80);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::RedGreen],
+                generic: 0,
+            },
+            180,
+            true,
+        );
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_payable_repeatable_hybrids_have_bounded_work_interleaved_n8() {
+        for order in [
+            interleaved_generic_payable_order(),
+            interleaved_hybrid_payable_order(),
+        ] {
+            let mut payable = ordered_multi_producer_djinn_manamorphose(&order);
+            let cost = announce_manamorphose(&mut payable, 8);
+            finish_payable_manamorphose(&mut payable, 8, &cost);
+            assert!(payable.runner.state().players[0].mana_pool.is_empty());
+        }
+
+        let mut order = interleaved_generic_payable_order();
+        order.push(ManaType::Colorless);
+        let mut pinned = ordered_multi_producer_djinn_manamorphose(&order);
+        let cost = announce_manamorphose(&mut pinned, 8);
+        let before = fingerprint(
+            &pinned.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let pin = before.last().unwrap().pip_id;
+        assert_ne!(pin, ManaPipId(0));
+        pinned
+            .runner
+            .act(GameAction::SpendPoolMana { pip_id: pin })
+            .unwrap();
+        assert_eq!(
+            pinned
+                .runner
+                .state()
+                .pending_cast
+                .as_ref()
+                .unwrap()
+                .pinned_pool_units,
+            vec![pin]
+        );
+        finish_payable_manamorphose(&mut pinned, 8, &cost);
+        let remainder = fingerprint(
+            &pinned.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        // CR 106.4a + CR 118.3a: the exact hinted pip pays; the one excess C
+        // keeps its original source, pip, restrictions, qualities and grants.
+        assert_eq!(remainder.len(), 1);
+        assert_eq!(remainder[0].color, ManaType::Colorless);
+        assert_ne!(remainder[0].pip_id, pin);
+        assert!(before.contains(&remainder[0]));
+    }
+
+    #[test]
+    fn djinn_manamorphose_selector_generic_short_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_generic_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        assert_payable_manamorphose_selector(&payable, &cost);
+        cancel_manamorphose(&mut payable);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_GENERIC_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let stack_before = short.runner.state().stack.clone();
+        // This attempt precedes any failing public PassPriority, so a baseline
+        // reducer panic cannot hide the count guard's zero-clone witness.
+        supplement_manamorphose_selector(&short, &cost, 0, false);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_selector_hybrid_short_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_hybrid_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        assert_payable_manamorphose_selector(&payable, &cost);
+        cancel_manamorphose(&mut payable);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_HYBRID_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let stack_before = short.runner.state().stack.clone();
+        // Supplementary pure selection of the actually announced cost, rather
+        // than a claim that a prior public refusal reached the payer.
+        supplement_manamorphose_selector(&short, &cost, 80, true);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        cancel_manamorphose(&mut short);
+    }
+
     #[test]
     fn fundable_hybrid_memo_preserves_semantic_prefix_gaps() {
         // SHAPE: no printed card combines {S} with a hybrid symbol (the local
@@ -5942,8 +6337,8 @@ mod tests {
         let late = [None, None, Some(ManaCostShard::RedGreen)];
         let mut memo = HybridResidualMemo::new(&pool, &order);
         assert_eq!(
-            memo.key(&pool, continuation, &early),
-            memo.key(&pool, continuation, &late)
+            memo.key(&pool, continuation, &early, None, None, None),
+            memo.key(&pool, continuation, &late, None, None, None)
         );
         let reject = |_: &ManaCost| false;
         let mut memo = Some(memo);
@@ -5993,8 +6388,8 @@ mod tests {
         let late = [None, None, Some(ManaCostShard::RedGreen)];
         let mut memo = HybridResidualMemo::new(&pool, &order);
         assert_ne!(
-            memo.key(&pool, continuation, &early),
-            memo.key(&pool, continuation, &late)
+            memo.key(&pool, continuation, &early, None, None, None),
+            memo.key(&pool, continuation, &late, None, None, None)
         );
         let mut memo = Some(memo);
         assert_eq!(
@@ -6044,18 +6439,21 @@ mod tests {
         let hybrid = [None, Some(ManaCostShard::RedGreen), None, None];
         let other = [None, None, Some(ManaCostShard::WhiteBlue), None];
         assert_ne!(
-            residual_memo.key(&pool, continuation, &hybrid),
-            residual_memo.key(&pool, continuation, &other)
+            residual_memo.key(&pool, continuation, &hybrid, None, None, None),
+            residual_memo.key(&pool, continuation, &other, None, None, None)
         );
         assert_ne!(
-            residual_memo.key(&pool, continuation, &hybrid),
+            residual_memo.key(&pool, continuation, &hybrid, None, None, None),
             residual_memo.key(
                 &pool,
                 PaymentContinuation {
                     quality_demand: SourceQualityDemand::default(),
                     ..continuation
                 },
-                &hybrid
+                &hybrid,
+                None,
+                None,
+                None
             )
         );
 
@@ -6093,6 +6491,1006 @@ mod tests {
                         .into_shape_and_pip()
                         .0
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_residual_memo_preserves_two_brid_slot_policy() {
+        // Supplemental typed combined cost: no printed mana/activation cost
+        // combines ordinary hybrid and two-brid. The nearest printed pieces
+        // are Manamorphose/Toluz and Reaper King. This preserves the existing
+        // greedy fallback's readings; its first refusal is not a legality claim.
+        let shards = [
+            ManaCostShard::RedGreen,
+            ManaCostShard::RedGreen,
+            ManaCostShard::TwoWhite,
+            ManaCostShard::Red,
+        ];
+        let order = [0, 1, 2, 3];
+        let continuation = PaymentContinuation {
+            shards: &shards,
+            generic: 0,
+            order: &order,
+            next_position: 2,
+            quality_demand: SourceQualityDemand::default(),
+        };
+        let root_cost = ManaCost::Cost {
+            shards: shards.to_vec(),
+            generic: 0,
+        };
+        let first = ManaPool::from_units(
+            [ManaType::Red, ManaType::Green, ManaType::Colorless].map(make_unit),
+        );
+        let second = ManaPool::from_units(
+            [ManaType::Green, ManaType::Red, ManaType::Colorless].map(make_unit),
+        );
+        let context = PaymentContext::Effect;
+        let demand = [0; 5];
+        let mut shared = HybridResidualMemo::new(&first, &order);
+        let first_key = shared.key(
+            &first,
+            continuation,
+            &[None, None],
+            Some(&context),
+            None,
+            Some(&demand),
+        );
+        let second_key = shared.key(
+            &second,
+            continuation,
+            &[None, None],
+            Some(&context),
+            None,
+            Some(&demand),
+        );
+        assert!(first_key.pool.ordered.is_some() && second_key.pool.ordered.is_some());
+        assert_ne!(first_key, second_key);
+        let mut shared = Some(shared);
+        let callback_calls = std::cell::Cell::new(0);
+        let reject = |_: &ManaCost| {
+            callback_calls.set(callback_calls.get() + 1);
+            false
+        };
+        let reduce = |pool: &ManaPool, memo: &mut Option<HybridResidualMemo>| {
+            let root = HybridWorkRoot::reducer(&root_cost, true);
+            let result = reduce_cost_by_pool_from(
+                pool,
+                continuation,
+                Some(&context),
+                None,
+                Some(&demand),
+                &[None, None],
+                Some(&reject),
+                memo,
+            );
+            root.residual(&result);
+            result
+        };
+        begin_hybrid_work("two-brid reducer shared/fresh policy", 1, 0);
+        let first_result = reduce(&first, &mut shared);
+        let second_result = reduce(&second, &mut shared);
+        assert_eq!(
+            first_result,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0
+            }
+        );
+        assert_eq!(second_result, ManaCost::NoCost);
+        for (pool, expected) in [(&first, first_result), (&second, second_result)] {
+            assert_eq!(
+                reduce(pool, &mut Some(HybridResidualMemo::new(pool, &order))),
+                expected
+            );
+        }
+        let work = take_hybrid_work();
+        assert_eq!(work.reductions.len(), 4);
+        assert!(work
+            .reductions
+            .iter()
+            .all(|root| root.requests == 1 && root.entry_clones == 1 && root.reuse == 0));
+        assert_eq!(
+            callback_calls.get(),
+            0,
+            "the suffix starts beyond both hybrids"
+        );
+    }
+
+    #[test]
+    fn failed_payment_memo_preserves_two_brid_convoke_slot_policy() {
+        // Supplemental helper-domain combined cost, nearest printed primitives:
+        // Manamorphose/Toluz, Reaper King and Chief Engineer. No printed card
+        // is claimed to have this cost. None is the convoke-eligible context;
+        // Effect would reject the stand-ins before a failure key is reached.
+        let shards = [
+            ManaCostShard::BlueBlack,
+            ManaCostShard::TwoWhite,
+            ManaCostShard::Red,
+        ];
+        let order = [0, 1, 2];
+        let continuation = PaymentContinuation {
+            shards: &shards,
+            generic: 0,
+            order: &order,
+            next_position: 1,
+            quality_demand: SourceQualityDemand::default(),
+        };
+        let convoke = |color| ManaUnit::convoke_payment(color, ObjectId(2));
+        let first = ManaPool::from_units(vec![
+            make_unit(ManaType::Blue),
+            convoke(ManaType::Green),
+            convoke(ManaType::Red),
+            convoke(ManaType::Colorless),
+        ]);
+        let second = ManaPool::from_units(vec![
+            make_unit(ManaType::Blue),
+            convoke(ManaType::Red),
+            convoke(ManaType::Green),
+            convoke(ManaType::Colorless),
+        ]);
+        let life_colors = crate::types::mana::LifePaymentColors::EMPTY;
+        let mut shared = FailedPaymentStates::default();
+        let first_key = shared.key(
+            continuation,
+            &first,
+            (ManaType::Blue, ManaType::Black),
+            &[],
+            0,
+            &[],
+            Some(0),
+            None,
+            None,
+            life_colors,
+        );
+        let second_key = shared.key(
+            continuation,
+            &second,
+            (ManaType::Blue, ManaType::Black),
+            &[],
+            0,
+            &[],
+            Some(0),
+            None,
+            None,
+            life_colors,
+        );
+        assert!(first_key.pool.ordered.is_some() && second_key.pool.ordered.is_some());
+        assert_ne!(first_key, second_key);
+        let pay = |pool: &ManaPool, failed: &mut FailedPaymentStates| {
+            let _root = HybridWorkRoot::payment("two-brid shared/fresh", continuation);
+            let mut remaining = pool.clone();
+            let result = continuation.pay_hybrid_and_suffix(
+                &mut remaining,
+                (ManaType::Blue, ManaType::Black),
+                None,
+                None,
+                None,
+                None,
+                life_colors,
+                &[],
+                0,
+                &[],
+                Some(0),
+                failed,
+            );
+            (result, fingerprint(&remaining.units().collect::<Vec<_>>()))
+        };
+        begin_hybrid_work("two-brid payer shared/fresh policy", 0, 2);
+        let (first_result, first_remaining) = pay(&first, &mut shared);
+        assert_eq!(
+            first_result,
+            Err(PaymentError::InsufficientMana),
+            "legacy greedy policy precondition, not a universal legality result"
+        );
+        assert_eq!(
+            first_remaining,
+            fingerprint(&first.units().collect::<Vec<_>>())
+        );
+        assert!(!shared.failed.is_empty());
+        let (second_result, second_remaining) = pay(&second, &mut shared);
+        let (spent, life) = second_result
+            .as_ref()
+            .expect("the other slot policy completes the payment");
+        assert_eq!(spent.len(), 4);
+        assert!(life.is_empty() && second_remaining.is_empty());
+        assert!(spent
+            .iter()
+            .any(|unit| unit.color == ManaType::Red && unit.is_convoke_payment()));
+        for (pool, expected, remaining) in [
+            (&first, &first_result, &first_remaining),
+            (&second, &second_result, &second_remaining),
+        ] {
+            let (fresh, fresh_remaining) = pay(pool, &mut FailedPaymentStates::default());
+            assert_eq!(&fresh, expected);
+            assert_eq!(&fresh_remaining, remaining);
+            if let (Ok((fresh, _)), Ok((shared, _))) = (&fresh, expected) {
+                assert_eq!(fingerprint(fresh), fingerprint(shared));
+            }
+        }
+        let work = take_hybrid_work();
+        assert_eq!(work.selectors.len(), 4);
+        assert!(work.selectors.iter().all(|attempt| attempt.entries == 1
+            && attempt.count_rejections == 0
+            && attempt.failed_key_hits == 0
+            && attempt.alternative_clones > 0));
+    }
+
+    #[test]
+    fn hybrid_residual_memo_preserves_hard_demand_convoke_slot_policy() {
+        // Typed helper-domain mixture. Chief Engineer supplies the nearest
+        // printed convoke primitive, not a claim that this is floated mana.
+        // Production hard demand uses Activation, which rejects convoke.
+        let shards = [ManaCostShard::RedGreen, ManaCostShard::Red];
+        let order = [0, 1];
+        let continuation = PaymentContinuation {
+            shards: &shards,
+            generic: 1,
+            order: &order,
+            next_position: 1,
+            quality_demand: SourceQualityDemand::default(),
+        };
+        let root_cost = ManaCost::Cost {
+            shards: shards.to_vec(),
+            generic: 1,
+        };
+        let real = make_unit(ManaType::Red);
+        let convoke = ManaUnit::convoke_payment(ManaType::Red, ObjectId(2));
+        let first = ManaPool::from_units(vec![convoke.clone(), real.clone()]);
+        let second = ManaPool::from_units(vec![real.clone(), convoke.clone()]);
+        let demand = [0, 0, 0, 1, 0];
+        let mut shared = HybridResidualMemo::new(&first, &order);
+        assert_ne!(
+            shared.classes.ordinal(&real.into_shape_and_pip().0),
+            shared.classes.ordinal(&convoke.into_shape_and_pip().0)
+        );
+        let first_key = shared.key(&first, continuation, &[None], None, None, Some(&demand));
+        let second_key = shared.key(&second, continuation, &[None], None, None, Some(&demand));
+        assert!(first_key.pool.ordered.is_some() && second_key.pool.ordered.is_some());
+        assert_ne!(first_key, second_key);
+        let mut shared = Some(shared);
+        let reject = |_: &ManaCost| false;
+        let reduce = |pool: &ManaPool,
+                      demand: Option<&ColorDemand>,
+                      memo: &mut Option<HybridResidualMemo>| {
+            let root = HybridWorkRoot::reducer(&root_cost, true);
+            let result = reduce_cost_by_pool_from(
+                pool,
+                continuation,
+                None,
+                None,
+                demand,
+                &[None],
+                Some(&reject),
+                memo,
+            );
+            root.residual(&result);
+            result
+        };
+        begin_hybrid_work("hard-demand mixed convoke shared/fresh", 1, 0);
+        let first_result = reduce(&first, Some(&demand), &mut shared);
+        let second_result = reduce(&second, Some(&demand), &mut shared);
+        assert_eq!(
+            first_result,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1
+            }
+        );
+        assert_eq!(second_result, ManaCost::NoCost);
+        for (pool, expected) in [(&first, first_result), (&second, second_result)] {
+            assert_eq!(
+                reduce(
+                    pool,
+                    Some(&demand),
+                    &mut Some(HybridResidualMemo::new(pool, &order))
+                ),
+                expected
+            );
+        }
+        // Changing the immutable hard demand gets its own cache. Without it,
+        // both orders are equivalent and the second call must really hit.
+        let mut no_demand = HybridResidualMemo::new(&first, &order);
+        let first_key = no_demand.key(&first, continuation, &[None], None, None, None);
+        let second_key = no_demand.key(&second, continuation, &[None], None, None, None);
+        assert!(first_key.pool.ordered.is_none());
+        assert_eq!(first_key, second_key);
+        let mut no_demand = Some(no_demand);
+        assert_eq!(reduce(&first, None, &mut no_demand), ManaCost::NoCost);
+        assert_eq!(reduce(&second, None, &mut no_demand), ManaCost::NoCost);
+        let work = take_hybrid_work();
+        assert_eq!(work.reductions.len(), 6);
+        assert!(work.reductions[..5]
+            .iter()
+            .all(|root| root.requests == 1 && root.entry_clones == 1));
+        assert_eq!(work.reductions[5].requests, 1);
+        assert_eq!(work.reductions[5].entry_clones, 0);
+        assert_eq!(work.reductions[5].reuse, 1);
+    }
+
+    #[test]
+    fn payment_memos_merge_admitted_mixed_classes_and_preserve_pins() {
+        // Typed helper-domain pools for a repeated printed Manamorphose cost.
+        // Snow/Z and Food Chain restrictions remain properties of actual units.
+        // Convoke uses Chief Engineer's neighboring primitive; this fixture
+        // makes no new printed ability or public convoke-path support claim.
+        let fixture = homogeneous_djinn_manamorphose(1, 0, 1, false);
+        let meta =
+            crate::game::casting::build_spell_meta(fixture.runner.state(), P0, fixture.spell)
+                .unwrap();
+        let context = PaymentContext::Spell(&meta);
+        assert_eq!(
+            fixture.runner.state().objects[&fixture.spell].mana_cost,
+            crate::types::mana::parse_mtgjson_mana_cost("{1}{R/G}")
+        );
+        let mut units = vec![
+            ManaUnit {
+                source_id: ObjectId(101),
+                pip_id: ManaPipId(1),
+                ..make_unit(ManaType::Red)
+            },
+            ManaUnit {
+                source_id: ObjectId(102),
+                pip_id: ManaPipId(2),
+                supertype: Some(crate::types::mana::ManaSupertype::Snow),
+                ..make_unit(ManaType::Red)
+            },
+            ManaUnit {
+                source_id: ObjectId(103),
+                pip_id: ManaPipId(3),
+                source_could_produce_two_or_more_colors: true,
+                ..make_unit(ManaType::Red)
+            },
+            ManaUnit {
+                source_id: ObjectId(104),
+                pip_id: ManaPipId(4),
+                restrictions: vec![ManaRestriction::OnlyForSpell],
+                ..make_unit(ManaType::Red)
+            },
+            ManaUnit::convoke_payment(ManaType::Red, ObjectId(105)),
+            ManaUnit {
+                source_id: ObjectId(106),
+                pip_id: ManaPipId(6),
+                restrictions: vec![ManaRestriction::OnlyForSpellType("Creature".to_string())],
+                ..make_unit(ManaType::Red)
+            },
+        ];
+        units.extend((10..17).map(|pip| ManaUnit {
+            source_id: ObjectId(100 + pip),
+            pip_id: ManaPipId(pip),
+            ..make_unit(ManaType::Colorless)
+        }));
+        for unit in &units {
+            assert_eq!(
+                spell_permits_unit(Some(&context), &unit.clone().into_shape_and_pip().0),
+                unit.pip_id != ManaPipId(6)
+            );
+        }
+        let first = ManaPool::from_units(units.clone());
+        let second = ManaPool::from_units(units.iter().rev().cloned());
+        let shards = vec![ManaCostShard::RedGreen; 6];
+        let order: Vec<_> = (0..shards.len()).collect();
+        let cost = ManaCost::Cost {
+            shards: shards.clone(),
+            generic: 6,
+        };
+        let continuation = PaymentContinuation {
+            shards: &shards,
+            generic: 6,
+            order: &order,
+            next_position: 1,
+            quality_demand: SourceQualityDemand::default(),
+        };
+        let life_colors = crate::types::mana::LifePaymentColors::EMPTY;
+        assert_eq!(
+            first.count_where(|unit| spell_permits_unit(Some(&context), unit)),
+            12
+        );
+        assert_eq!(continuation.minimum_mana_units(None, life_colors, 0), 12);
+        let payer_key = |states: &mut FailedPaymentStates,
+                         pool: &ManaPool,
+                         continuation: PaymentContinuation<'_>,
+                         pins: &[ManaPipId],
+                         cursor,
+                         preferences: &[(ManaType, ManaType, ManaType)],
+                         budget| {
+            states.key(
+                continuation,
+                pool,
+                (ManaType::Red, ManaType::Green),
+                pins,
+                cursor,
+                preferences,
+                budget,
+                Some(&context),
+                None,
+                life_colors,
+            )
+        };
+        let mut failed = FailedPaymentStates::default();
+        let first_key = payer_key(&mut failed, &first, continuation, &[], 0, &[], Some(0));
+        let second_key = payer_key(&mut failed, &second, continuation, &[], 0, &[], Some(0));
+        assert!(first_key.pool.ordered.is_none());
+        assert_eq!(first_key, second_key);
+        let mut more_units = units.clone();
+        more_units.push(make_unit(ManaType::Colorless));
+        assert_ne!(
+            first_key,
+            payer_key(
+                &mut failed,
+                &ManaPool::from_units(more_units),
+                continuation,
+                &[],
+                0,
+                &[],
+                Some(0)
+            )
+        );
+        let mut changed_restriction = units.clone();
+        changed_restriction[5].restrictions.clear();
+        assert_ne!(
+            first_key,
+            payer_key(
+                &mut failed,
+                &ManaPool::from_units(changed_restriction),
+                continuation,
+                &[],
+                0,
+                &[],
+                Some(0)
+            )
+        );
+        for quality_demand in [
+            SourceQualityDemand {
+                snow: 1,
+                multicolor: 0,
+            },
+            SourceQualityDemand {
+                snow: 0,
+                multicolor: 1,
+            },
+        ] {
+            let key = payer_key(
+                &mut failed,
+                &first,
+                PaymentContinuation {
+                    quality_demand,
+                    ..continuation
+                },
+                &[],
+                0,
+                &[],
+                Some(0),
+            );
+            assert!(key.pool.ordered.is_some());
+            assert_ne!(first_key, key);
+        }
+        assert_ne!(
+            first_key,
+            payer_key(&mut failed, &first, continuation, &[], 1, &[], Some(0))
+        );
+        assert_ne!(
+            first_key,
+            payer_key(&mut failed, &first, continuation, &[], 0, &[], None)
+        );
+        assert_ne!(
+            first_key,
+            payer_key(
+                &mut failed,
+                &first,
+                continuation,
+                &[],
+                0,
+                &[(ManaType::Red, ManaType::Green, ManaType::Red)],
+                Some(0)
+            )
+        );
+        assert_ne!(
+            payer_key(
+                &mut failed,
+                &first,
+                continuation,
+                &[ManaPipId(3)],
+                0,
+                &[],
+                Some(0)
+            ),
+            payer_key(
+                &mut failed,
+                &first,
+                continuation,
+                &[ManaPipId(4)],
+                0,
+                &[],
+                Some(0)
+            )
+        );
+
+        let pay = |pool: &ManaPool, failed: &mut FailedPaymentStates| {
+            let _root = HybridWorkRoot::payment("admitted mixed-class shared/fresh", continuation);
+            let mut remaining = pool.clone();
+            let result = continuation.pay_hybrid_and_suffix(
+                &mut remaining,
+                (ManaType::Red, ManaType::Green),
+                None,
+                Some(&context),
+                None,
+                None,
+                life_colors,
+                &[],
+                0,
+                &[],
+                Some(0),
+                failed,
+            );
+            assert_eq!(
+                fingerprint(&remaining.units().collect::<Vec<_>>()),
+                fingerprint(&pool.units().collect::<Vec<_>>())
+            );
+            result
+        };
+        begin_hybrid_work("admitted mixed-class failed-key reuse", 0, 12);
+        assert_eq!(
+            pay(&first, &mut failed),
+            Err(PaymentError::InsufficientMana)
+        );
+        assert!(failed.failed.contains(&first_key));
+        assert_eq!(
+            pay(&second, &mut failed),
+            Err(PaymentError::InsufficientMana)
+        );
+        assert_eq!(
+            pay(&second, &mut FailedPaymentStates::default()),
+            Err(PaymentError::InsufficientMana)
+        );
+        let work = take_hybrid_work();
+        assert_eq!(work.selectors.len(), 3);
+        assert!(work.selectors[0].entries > 0 && work.selectors[0].alternative_clones > 0);
+        assert!(work
+            .selectors
+            .iter()
+            .all(|attempt| attempt.count_rejections == 0));
+        assert_eq!(work.selectors[1].entries, 1);
+        assert_eq!(work.selectors[1].alternative_clones, 0);
+        assert_eq!(work.selectors[1].failed_key_hits, 1);
+
+        let reduction = PaymentContinuation {
+            next_position: 0,
+            ..continuation
+        };
+        let mut residuals = HybridResidualMemo::new(&first, &order);
+        let residual_key = residuals.key(&first, reduction, &[], Some(&context), None, None);
+        assert!(residual_key.pool.ordered.is_none());
+        assert_eq!(
+            residual_key,
+            residuals.key(&second, reduction, &[], Some(&context), None, None)
+        );
+        let mut residuals = Some(residuals);
+        let reject = |_: &ManaCost| false;
+        let reduce = |pool: &ManaPool, memo: &mut Option<HybridResidualMemo>| {
+            let root = HybridWorkRoot::reducer(&cost, true);
+            let result = reduce_cost_by_pool_from(
+                pool,
+                reduction,
+                Some(&context),
+                None,
+                None,
+                &[],
+                Some(&reject),
+                memo,
+            );
+            root.residual(&result);
+            result
+        };
+        begin_hybrid_work("admitted mixed-class exact residual reuse", 128, 0);
+        let expected = ManaCost::Cost {
+            shards: vec![ManaCostShard::RedGreen],
+            generic: 0,
+        };
+        assert_eq!(reduce(&first, &mut residuals), expected);
+        assert_eq!(reduce(&second, &mut residuals), expected);
+        assert_eq!(
+            reduce(&second, &mut Some(HybridResidualMemo::new(&second, &order))),
+            expected
+        );
+        let work = take_hybrid_work();
+        assert_eq!(work.reductions.len(), 3);
+        assert!(work.reductions[0].alternative_entries > 0);
+        assert_eq!(work.reductions[1].requests, 1);
+        assert_eq!(work.reductions[1].entry_clones, 0);
+        assert_eq!(work.reductions[1].reuse, 1);
+
+        // CR 106.6 + CR 118.3a: one more eligible R repairs the colored
+        // shortage; success returns only original units with full provenance.
+        let mut affordable_units = units.clone();
+        affordable_units.push(rich_unit(ManaType::Red, 107, 7));
+        let original = fingerprint(&affordable_units);
+        let mut affordable = ManaPool::from_units(affordable_units);
+        let (spent, life) = pay_cost_with_demand_and_choices(
+            &mut affordable,
+            &cost,
+            None,
+            Some(&context),
+            None,
+            None,
+            life_colors,
+            &[ManaPipId(7)],
+        )
+        .unwrap();
+        assert_eq!(spent.len(), 12);
+        assert!(life.is_empty());
+        assert!(spent.iter().any(|unit| unit.pip_id == ManaPipId(7)));
+        assert!(!spent.iter().any(|unit| unit.pip_id == ManaPipId(6)));
+        let mut accounted = fingerprint(&spent);
+        accounted.extend(fingerprint(&affordable.units().collect::<Vec<_>>()));
+        assert_eq!(accounted.len(), original.len());
+        for unit in original {
+            let index = accounted.iter().position(|actual| *actual == unit).unwrap();
+            accounted.remove(index);
+        }
+        assert!(accounted.is_empty());
+
+        // Explicit helper pin zero must remain Some(0), unlike an absent pin.
+        let zero = ManaPool::from_units([make_unit(ManaType::Red)]);
+        let stamped = ManaPool::from_units([ManaUnit {
+            pip_id: ManaPipId(99),
+            ..make_unit(ManaType::Red)
+        }]);
+        let unpinned = payer_key(&mut failed, &zero, continuation, &[], 0, &[], Some(0));
+        assert_eq!(
+            unpinned,
+            payer_key(&mut failed, &stamped, continuation, &[], 0, &[], Some(0))
+        );
+        let pinned_zero = payer_key(
+            &mut failed,
+            &zero,
+            continuation,
+            &[ManaPipId(0)],
+            0,
+            &[],
+            Some(0),
+        );
+        assert_eq!(pinned_zero.pool.pinned.len(), 1);
+        assert_eq!(pinned_zero.pool.pinned[0].1, ManaPipId(0));
+        assert_ne!(unpinned, pinned_zero);
+        let sensitive = PaymentContinuation {
+            quality_demand: SourceQualityDemand {
+                snow: 1,
+                multicolor: 0,
+            },
+            ..continuation
+        };
+        let absent = payer_key(&mut failed, &zero, sensitive, &[], 0, &[], Some(0));
+        let present = payer_key(
+            &mut failed,
+            &zero,
+            sensitive,
+            &[ManaPipId(0)],
+            0,
+            &[],
+            Some(0),
+        );
+        assert_eq!(absent.pool.ordered.as_ref().unwrap()[0].1, None);
+        assert_eq!(
+            present.pool.ordered.as_ref().unwrap()[0].1,
+            Some(ManaPipId(0))
+        );
+        assert_ne!(absent, present);
+        let duplicate_zero =
+            ManaPool::from_units([make_unit(ManaType::Red), make_unit(ManaType::Red)]);
+        let duplicate_key = payer_key(
+            &mut failed,
+            &duplicate_zero,
+            continuation,
+            &[ManaPipId(0), ManaPipId(0)],
+            0,
+            &[],
+            Some(0),
+        );
+        assert_eq!(
+            duplicate_key.pool.pinned.len(),
+            2,
+            "each actual matching unit remains in the pin inventory"
+        );
+        assert_eq!(duplicate_key.pool.pinned[0], duplicate_key.pool.pinned[1]);
+        assert_ne!(pinned_zero, duplicate_key);
+    }
+
+    #[test]
+    fn payment_pool_order_guards_follow_typed_continuations() {
+        // SHAPE supplements the actual shared-cache results above. Typed
+        // combinations do not claim a printed card: nearest primitives are
+        // Manamorphose, Astrolabe, Experiment Five, Reaper King and Soul Burn.
+        let pool = ManaPool::from_units([
+            make_unit(ManaType::Red),
+            ManaUnit::convoke_payment(ManaType::Red, ObjectId(2)),
+        ]);
+        let life_colors = crate::types::mana::LifePaymentColors::EMPTY;
+        for (shard, admitted) in [
+            (ManaCostShard::Red, true),
+            (ManaCostShard::RedGreen, true),
+            (ManaCostShard::ColorlessRed, true),
+            (ManaCostShard::PhyrexianRed, true),
+            (ManaCostShard::PhyrexianRedGreen, true),
+            (ManaCostShard::X, true),
+            (ManaCostShard::Snow, false),
+            (ManaCostShard::TwoOrMoreColorSource, false),
+            (ManaCostShard::TwoBlack, false),
+        ] {
+            let shards = [shard];
+            let order = [0];
+            let continuation = PaymentContinuation {
+                shards: &shards,
+                generic: 0,
+                order: &order,
+                next_position: 0,
+                quality_demand: SourceQualityDemand::default(),
+            };
+            let mut failed = FailedPaymentStates::default();
+            let key = failed.key(
+                continuation,
+                &pool,
+                (ManaType::Red, ManaType::Green),
+                &[],
+                0,
+                &[],
+                Some(0),
+                None,
+                None,
+                life_colors,
+            );
+            assert_eq!(key.pool.ordered.is_none(), admitted, "{shard:?}");
+            let mut memo = HybridResidualMemo::new(&pool, &order);
+            assert_eq!(
+                memo.key(&pool, continuation, &[], None, None, None)
+                    .pool
+                    .ordered
+                    .is_none(),
+                admitted,
+                "{shard:?}"
+            );
+            if shard == ManaCostShard::TwoBlack {
+                let mut colors = life_colors;
+                colors.insert(ManaColor::Black);
+                assert!(matches!(
+                    effective_shard_requirement(shard_to_mana_type(shard), colors),
+                    ShardRequirement::TwoGenericHybridPhyrexian(ManaType::Black)
+                ));
+                assert!(failed
+                    .key(
+                        continuation,
+                        &pool,
+                        (ManaType::Red, ManaType::Green),
+                        &[],
+                        0,
+                        &[],
+                        Some(0),
+                        None,
+                        None,
+                        colors
+                    )
+                    .pool
+                    .ordered
+                    .is_some());
+            }
+        }
+
+        let shards = [ManaCostShard::RedGreen, ManaCostShard::Red];
+        let order = [0, 1];
+        let continuation = PaymentContinuation {
+            shards: &shards,
+            generic: 1,
+            order: &order,
+            next_position: 1,
+            quality_demand: SourceQualityDemand::default(),
+        };
+        for permission in [
+            ManaSpendPermission::AnyColor,
+            ManaSpendPermission::AnyTypeOrColor,
+        ] {
+            let mut failed = FailedPaymentStates::default();
+            assert!(failed
+                .key(
+                    continuation,
+                    &pool,
+                    (ManaType::Red, ManaType::Green),
+                    &[],
+                    0,
+                    &[],
+                    Some(0),
+                    None,
+                    Some(permission),
+                    life_colors
+                )
+                .pool
+                .ordered
+                .is_some());
+            let mut memo = HybridResidualMemo::new(&pool, &order);
+            assert!(memo
+                .key(&pool, continuation, &[None], None, Some(permission), None)
+                .pool
+                .ordered
+                .is_some());
+        }
+        let mut restricted = spell_meta(false);
+        restricted.spend_only_on_x_colors = Some(vec![ManaColor::Red, ManaColor::Black]);
+        restricted.spend_only_on_x_generic_count = 2;
+        let context = PaymentContext::Spell(&restricted);
+        let mut failed = FailedPaymentStates::default();
+        assert!(failed
+            .key(
+                continuation,
+                &pool,
+                (ManaType::Red, ManaType::Green),
+                &[],
+                0,
+                &[],
+                Some(0),
+                Some(&context),
+                None,
+                life_colors
+            )
+            .pool
+            .ordered
+            .is_some());
+        let mut memo = HybridResidualMemo::new(&pool, &order);
+        assert!(memo
+            .key(&pool, continuation, &[None], Some(&context), None, None)
+            .pool
+            .ordered
+            .is_some());
+        let no_generic = PaymentContinuation {
+            generic: 0,
+            ..continuation
+        };
+        assert!(FailedPaymentStates::default()
+            .key(
+                no_generic,
+                &pool,
+                (ManaType::Red, ManaType::Green),
+                &[],
+                0,
+                &[],
+                Some(0),
+                Some(&context),
+                None,
+                life_colors
+            )
+            .pool
+            .ordered
+            .is_none());
+
+        let demand = [0, 0, 0, 1, 0];
+        assert!(continuation.has_mixed_demanded_color(&pool, None, Some(&demand)));
+        assert!(!no_generic.has_mixed_demanded_color(&pool, None, Some(&demand)));
+        assert!(!continuation.has_mixed_demanded_color(&pool, None, Some(&[0; 5])));
+        let other_shards = [ManaCostShard::RedGreen, ManaCostShard::Blue];
+        assert!(!PaymentContinuation {
+            shards: &other_shards,
+            ..continuation
+        }
+        .has_mixed_demanded_color(&pool, None, Some(&demand)));
+        let real_only = ManaPool::from_units([make_unit(ManaType::Red), make_unit(ManaType::Red)]);
+        assert!(!continuation.has_mixed_demanded_color(&real_only, None, Some(&demand)));
+        let reversed = ManaPool::from_units(pool.units().collect::<Vec<_>>().into_iter().rev());
+        let activation = PaymentContext::Activation {
+            source_types: &[],
+            source_subtypes: &[],
+            ability_tag: None,
+            mana_color_constraint: crate::types::mana::ActivationManaColorConstraint::Unrestricted,
+        };
+        let reject = |_: &ManaCost| false;
+        for context in [PaymentContext::Effect, activation] {
+            assert!(!continuation.has_mixed_demanded_color(&pool, Some(&context), Some(&demand)));
+            assert_eq!(
+                pool.count_where(
+                    |unit| unit.is_convoke_payment() && spell_permits_unit(Some(&context), unit)
+                ),
+                0
+            );
+            let mut memo = Some(HybridResidualMemo::new(&pool, &order));
+            for pool in [&pool, &reversed] {
+                assert_eq!(
+                    reduce_cost_by_pool_from(
+                        pool,
+                        continuation,
+                        Some(&context),
+                        None,
+                        Some(&demand),
+                        &[None],
+                        Some(&reject),
+                        &mut memo
+                    ),
+                    ManaCost::Cost {
+                        shards: vec![],
+                        generic: 1
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn payment_pool_counts_ignore_later_class_interning() {
+        // Defensive lazy-key invariant, not a claim that normal hybrid-short
+        // production seeds from C alone. Each dictionary is append-only and
+        // each cache keeps one immutable continuation/context/pin authority.
+        for tail in [ManaCostShard::RedGreen, ManaCostShard::TwoWhite] {
+            let shards = [ManaCostShard::RedGreen, tail];
+            let order = [0, 1];
+            let continuation = PaymentContinuation {
+                shards: &shards,
+                generic: 0,
+                order: &order,
+                next_position: 1,
+                quality_demand: SourceQualityDemand::default(),
+            };
+            let c = |pip| ManaUnit {
+                pip_id: ManaPipId(pip),
+                ..make_unit(ManaType::Colorless)
+            };
+            let pool = ManaPool::from_units([c(1), c(2)]);
+            let parent = ManaPool::from_units([
+                c(1),
+                c(2),
+                make_unit(ManaType::Red),
+                make_unit(ManaType::Green),
+            ]);
+            let smaller = ManaPool::from_units([c(1)]);
+            let life_colors = crate::types::mana::LifePaymentColors::EMPTY;
+            let mut failed = FailedPaymentStates::default();
+            let key = |states: &mut FailedPaymentStates, pool: &ManaPool, pins: &[ManaPipId]| {
+                states.key(
+                    continuation,
+                    pool,
+                    (ManaType::Red, ManaType::Green),
+                    pins,
+                    0,
+                    &[],
+                    Some(0),
+                    None,
+                    None,
+                    life_colors,
+                )
+            };
+            let before = key(&mut failed, &pool, &[ManaPipId(1)]);
+            assert_eq!(before.pool.counts, vec![(0, 2)]);
+            assert_eq!(before.pool.pinned, vec![(0, ManaPipId(1))]);
+            assert_eq!(
+                before.pool.ordered.is_some(),
+                tail == ManaCostShard::TwoWhite
+            );
+            let stored = key(&mut failed, &pool, &[ManaPipId(1)]);
+            failed.failed.insert(stored);
+            let _ = key(&mut failed, &parent, &[ManaPipId(1)]);
+            let after = key(&mut failed, &pool, &[ManaPipId(1)]);
+            assert_eq!(after.pool.counts, vec![(0, 2)]);
+            assert_eq!(before, after);
+            assert!(failed.failed.contains(&after));
+            assert_ne!(after, key(&mut failed, &smaller, &[ManaPipId(1)]));
+            assert_ne!(after, key(&mut failed, &pool, &[ManaPipId(2)]));
+
+            let mut memo = HybridResidualMemo::new(&pool, &order);
+            let before = memo.key(&pool, continuation, &[None], None, None, None);
+            assert_eq!(before.pool.counts, vec![(0, 2)]);
+            assert_eq!(
+                before.pool.ordered.is_some(),
+                tail == ManaCostShard::TwoWhite
+            );
+            let stored = memo.key(&pool, continuation, &[None], None, None, None);
+            let sentinel = ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            };
+            memo.results.insert(stored, sentinel.clone());
+            let _ = memo.key(&parent, continuation, &[None], None, None, None);
+            let after = memo.key(&pool, continuation, &[None], None, None, None);
+            assert_eq!(after.pool.counts, vec![(0, 2)]);
+            assert_eq!(before, after);
+            assert_eq!(memo.results.get(&after), Some(&sentinel));
+            assert_ne!(
+                after,
+                memo.key(&smaller, continuation, &[None], None, None, None)
             );
         }
     }
