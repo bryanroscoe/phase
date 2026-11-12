@@ -5466,10 +5466,17 @@ mod tests {
         if n == 1 {
             assert!(records.is_empty());
         } else {
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].origin, AdditionalCostOrigin::Replicate);
-            assert_eq!(records[0].origin_ordinal, 0);
-            assert_eq!(records[0].count, (n - 1) as u32);
+            // CR 702.56a + CR 702.56b: this instance has n - 1 paid repetitions.
+            assert_eq!(records.len(), n - 1);
+            for record in records {
+                assert_eq!(record.origin, AdditionalCostOrigin::Replicate);
+                assert_eq!(record.origin_ordinal, 0);
+                assert_eq!(record.count, 1);
+            }
+            assert_eq!(
+                records.iter().map(|record| record.count).sum::<u32>(),
+                (n - 1) as u32
+            );
         }
         let after = fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>());
         assert_eq!(after.len(), before.len() - 2 * n);
