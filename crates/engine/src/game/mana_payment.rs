@@ -5081,24 +5081,32 @@ mod tests {
     }
 
     fn multi_producer_djinn_manamorphose(r: usize, g: usize, c: usize) -> DjinnManamorphoseFixture {
+        let order: Vec<_> = [
+            (ManaType::Red, r),
+            (ManaType::Green, g),
+            (ManaType::Colorless, c),
+        ]
+        .into_iter()
+        .flat_map(|(color, count)| std::iter::repeat_n(color, count))
+        .collect();
+        ordered_multi_producer_djinn_manamorphose(&order)
+    }
+
+    fn ordered_multi_producer_djinn_manamorphose(order: &[ManaType]) -> DjinnManamorphoseFixture {
         let (mut scenario, djinn, spell) = djinn_manamorphose_board();
         let mut producers = Vec::new();
-        for _ in 0..r {
-            producers.push((scenario.add_basic_land(P0, ManaColor::Red), ManaType::Red));
-        }
-        for _ in 0..g {
-            producers.push((
-                scenario.add_basic_land(P0, ManaColor::Green),
-                ManaType::Green,
-            ));
-        }
-        for _ in 0..c {
-            producers.push((
-                scenario
+        for &color in order {
+            let source = match color {
+                ManaType::Red => scenario.add_basic_land(P0, ManaColor::Red),
+                ManaType::Green => scenario.add_basic_land(P0, ManaColor::Green),
+                ManaType::Colorless => scenario
                     .add_land_from_oracle(P0, "Wastes", "{T}: Add {C}.")
                     .id(),
-                ManaType::Colorless,
-            ));
+                ManaType::White | ManaType::Blue | ManaType::Black => {
+                    panic!("this real-land fixture uses only Mountain, Forest and Wastes")
+                }
+            };
+            producers.push((source, color));
         }
         let mut runner = scenario.build();
         for &(source, color) in &producers {
@@ -5915,6 +5923,244 @@ mod tests {
             true,
         );
         supplement_manamorphose_selector(&short, &cost, 80, true);
+        cancel_manamorphose(&mut short);
+    }
+
+    const INTERLEAVED_GENERIC_SHORT: [ManaType; 15] = {
+        use ManaType::{Colorless as C, Green as G, Red as R};
+        [C, C, R, C, R, C, G, G, G, C, G, R, C, R, C]
+    };
+    const INTERLEAVED_HYBRID_SHORT: [ManaType; 16] = {
+        use ManaType::{Colorless as C, Green as G, Red as R};
+        [C, C, G, C, C, G, C, C, R, R, C, R, R, C, G, C]
+    };
+
+    fn interleaved_generic_payable_order() -> Vec<ManaType> {
+        let mut order = INTERLEAVED_GENERIC_SHORT.to_vec();
+        order.push(ManaType::Colorless);
+        order
+    }
+
+    fn interleaved_hybrid_payable_order() -> Vec<ManaType> {
+        let mut order = INTERLEAVED_HYBRID_SHORT.to_vec();
+        *order.last_mut().unwrap() = ManaType::Green;
+        order
+    }
+
+    fn assert_payable_manamorphose_selector(fixture: &DjinnManamorphoseFixture, cost: &ManaCost) {
+        let state = fixture.runner.state();
+        let meta = crate::game::casting::build_spell_meta(state, P0, fixture.spell).unwrap();
+        let context = PaymentContext::Spell(&meta);
+        let permissions =
+            crate::game::static_abilities::build_cost_permission_context(state, P0, None);
+        assert!(permissions.mana_spend_permission.is_none() && permissions.life_colors.is_empty());
+        let before = fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>());
+        begin_hybrid_work("independent payable announced-cost selector", 0, 8);
+        let (spent, life) = select_mana_payment_with_life_budget(
+            &state.players[0].mana_pool,
+            cost,
+            None,
+            Some(&context),
+            permissions.mana_spend_permission,
+            None,
+            permissions.life_colors,
+            &[],
+            Some(permissions.max_life as usize),
+        )
+        .expect("the paired publicly announced cost is affordable");
+        let work = take_hybrid_work();
+        assert!(work.reductions.is_empty());
+        assert_eq!(work.selectors.len(), 1);
+        let attempt = &work.selectors[0];
+        assert_eq!(attempt.cost, *cost);
+        assert_eq!(attempt.next_position, 0);
+        assert!(attempt.entries > 0 && attempt.alternative_clones > 0);
+        assert!(attempt.alternative_clones <= 8);
+        assert_eq!(attempt.count_rejections, 0);
+        // CR 118.3a + CR 118.10: selection returns sixteen distinct actual
+        // units without spending or transferring any unit's provenance.
+        assert_eq!(spent.len(), 16);
+        assert!(life.is_empty());
+        let mut available = before.clone();
+        for unit in fingerprint(&spent) {
+            let index = available
+                .iter()
+                .position(|original| *original == unit)
+                .unwrap();
+            available.remove(index);
+        }
+        assert_eq!(
+            fingerprint(&state.players[0].mana_pool.units().collect::<Vec<_>>()),
+            before
+        );
+    }
+
+    #[test]
+    fn djinn_manamorphose_failing_generic_suffix_is_rejected_with_bounded_work_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_generic_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_GENERIC_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 15);
+        let stack_before = short.runner.state().stack.clone();
+        begin_hybrid_work("public generic-short interleaved n8", 225, 0);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 1,
+            },
+            225,
+            true,
+        );
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_equivalent_hybrid_failures_are_reused_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_hybrid_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        finish_payable_manamorphose(&mut payable, 8, &cost);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_HYBRID_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before.len(), 16);
+        let stack_before = short.runner.state().stack.clone();
+        begin_hybrid_work("public hybrid-short interleaved n8", 180, 80);
+        assert!(short.runner.act(GameAction::PassPriority).is_err());
+        let work = take_hybrid_work();
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        assert_unpayable_reducer_work(
+            &work,
+            &cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::RedGreen],
+                generic: 0,
+            },
+            180,
+            true,
+        );
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_payable_repeatable_hybrids_have_bounded_work_interleaved_n8() {
+        for order in [
+            interleaved_generic_payable_order(),
+            interleaved_hybrid_payable_order(),
+        ] {
+            let mut payable = ordered_multi_producer_djinn_manamorphose(&order);
+            let cost = announce_manamorphose(&mut payable, 8);
+            finish_payable_manamorphose(&mut payable, 8, &cost);
+            assert!(payable.runner.state().players[0].mana_pool.is_empty());
+        }
+
+        let mut order = interleaved_generic_payable_order();
+        order.push(ManaType::Colorless);
+        let mut pinned = ordered_multi_producer_djinn_manamorphose(&order);
+        let cost = announce_manamorphose(&mut pinned, 8);
+        let before = fingerprint(
+            &pinned.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let pin = before.last().unwrap().pip_id;
+        assert_ne!(pin, ManaPipId(0));
+        pinned
+            .runner
+            .act(GameAction::SpendPoolMana { pip_id: pin })
+            .unwrap();
+        assert_eq!(
+            pinned
+                .runner
+                .state()
+                .pending_cast
+                .as_ref()
+                .unwrap()
+                .pinned_pool_units,
+            vec![pin]
+        );
+        finish_payable_manamorphose(&mut pinned, 8, &cost);
+        let remainder = fingerprint(
+            &pinned.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        // CR 106.4a + CR 118.3a: the exact hinted pip pays; the one excess C
+        // keeps its original source, pip, restrictions, qualities and grants.
+        assert_eq!(remainder.len(), 1);
+        assert_eq!(remainder[0].color, ManaType::Colorless);
+        assert_ne!(remainder[0].pip_id, pin);
+        assert!(before.contains(&remainder[0]));
+    }
+
+    #[test]
+    fn djinn_manamorphose_selector_generic_short_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_generic_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        assert_payable_manamorphose_selector(&payable, &cost);
+        cancel_manamorphose(&mut payable);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_GENERIC_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let stack_before = short.runner.state().stack.clone();
+        // This attempt precedes any failing public PassPriority, so a baseline
+        // reducer panic cannot hide the count guard's zero-clone witness.
+        supplement_manamorphose_selector(&short, &cost, 0, false);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
+        cancel_manamorphose(&mut short);
+    }
+
+    #[test]
+    fn djinn_manamorphose_selector_hybrid_short_interleaved_n8() {
+        let mut payable =
+            ordered_multi_producer_djinn_manamorphose(&interleaved_hybrid_payable_order());
+        let cost = announce_manamorphose(&mut payable, 8);
+        assert_payable_manamorphose_selector(&payable, &cost);
+        cancel_manamorphose(&mut payable);
+
+        let mut short = ordered_multi_producer_djinn_manamorphose(&INTERLEAVED_HYBRID_SHORT);
+        let cost = announce_manamorphose(&mut short, 8);
+        let before = fingerprint(
+            &short.runner.state().players[0]
+                .mana_pool
+                .units()
+                .collect::<Vec<_>>(),
+        );
+        let stack_before = short.runner.state().stack.clone();
+        // Supplementary pure selection of the actually announced cost, rather
+        // than a claim that a prior public refusal reached the payer.
+        supplement_manamorphose_selector(&short, &cost, 80, true);
+        assert_refused_manamorphose(&short, &cost, &before, &stack_before);
         cancel_manamorphose(&mut short);
     }
 
