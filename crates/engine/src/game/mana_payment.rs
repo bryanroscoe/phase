@@ -1827,6 +1827,10 @@ struct HybridPaymentWork {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared observer includes memo events absent in the pre-repair comparison"
+)]
 enum HybridWorkEvent {
     ReducerRequest,
     ReducerEntryClone,
