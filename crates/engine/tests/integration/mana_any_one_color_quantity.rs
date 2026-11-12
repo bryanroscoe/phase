@@ -6871,3 +6871,118 @@ fn nyx_choice_dependent_count_uses_this_activation_color() {
         assert_complete(&r, expected);
     }
 }
+
+#[test]
+fn manual_mana_ability_payment_keeps_selected_counted_source_output() {
+    let mut s = board();
+    let signet = s
+        .add_artifact_from_oracle(P0, "Rakdos Signet", "{1}, {T}: Add {B}{R}.")
+        .with_mana_cost(parse_mtgjson_mana_cost("{2}"))
+        .id();
+    let nykthos = s
+        .add_land_from_oracle(P0, "Nykthos, Shrine to Nyx", NYKTHOS)
+        .as_legendary()
+        .id();
+    s.add_creature_from_oracle(P0, "Leatherback Baloth", 4, 5, "")
+        .with_mana_cost(parse_mtgjson_mana_cost("{G}{G}{G}"));
+    let aura = s
+        .add_enchantment_from_oracle(P0, "Fertile Ground", FERTILE_GROUND)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(parse_mtgjson_mana_cost("{1}{G}"))
+        .id();
+    let funders: Vec<_> = (0..2)
+        .map(|_| s.add_land_from_oracle(P0, "Wastes", "{T}: Add {C}.").id())
+        .collect();
+    let mut r = s.build();
+    engine::game::effects::attach::attach_to(r.state_mut(), aura, nykthos);
+    evaluate_layers(r.state_mut());
+    // CR 700.5: Baloth contributes three G symbols and Fertile Ground one.
+    assert_eq!(
+        engine::game::devotion::count_devotion(r.state(), P0, &[ManaColor::Green]),
+        4
+    );
+    let index = r.state().objects[&signet]
+        .abilities
+        .iter()
+        .position(engine::game::mana_abilities::is_mana_ability)
+        .unwrap();
+    r.act(GameAction::ActivateAbility {
+        source_id: signet,
+        ability_index: index,
+        payment_mode: CastPaymentMode::Manual,
+    })
+    .unwrap();
+    assert!(matches!(
+        r.state().waiting_for,
+        WaitingFor::ManaAbilityManaPayment { .. }
+    ));
+    assert!(r.state().players[0].mana_pool.is_empty());
+    assert!(!r.state().objects[&signet].tapped);
+    assert!(funders.iter().all(|id| !r.state().objects[id].tapped));
+
+    let (_, _, grouped) = legal_actions_full(r.state());
+    let action = grouped[&nykthos]
+        .iter()
+        .find(|action| matches!(action,
+            GameAction::TapLandForMana { selection }
+            if selection.mana_type == ManaType::Green
+                && selection.taps_for_mana.iter().any(|selected|
+                    selected.source.object_id == aura
+                        && selected.production_override
+                            == engine::types::game_state::ProductionOverride::SingleColor(ManaType::Blue))))
+        .expect("the inner activation offers independent Nykthos G and Aura U")
+        .clone();
+    let events = r.act(action).unwrap().events;
+    // CR 601.2g-h + CR 605.4a: Wastes pays the inner activation before its
+    // four G and the selected Aura U return to the outer manual payment.
+    for source in &funders {
+        assert_eq!(production_count(&events, *source, ManaType::Colorless), 1);
+        assert!(r.state().objects[source].tapped);
+    }
+    assert_eq!(production_count(&events, nykthos, ManaType::Green), 4);
+    assert_eq!(production_count(&events, aura, ManaType::Blue), 1);
+    assert_eq!(production_count(&events, aura, ManaType::White), 0);
+    let WaitingFor::ManaAbilityManaPayment {
+        player,
+        pending_mana_ability,
+    } = &r.state().waiting_for
+    else {
+        panic!("the selected inner source must return to the manual outer window");
+    };
+    assert_eq!(*player, P0);
+    assert_eq!(pending_mana_ability.source_id, signet);
+    assert_eq!(pending_mana_ability.payment_mode, CastPaymentMode::Manual);
+    assert!(!r.state().objects[&signet].tapped);
+    assert_eq!(r.state().players[0].mana_pool.total(), 5);
+    let aura_pip = r.state().players[0]
+        .mana_pool
+        .units()
+        .find(|unit| unit.source_id == aura && unit.color == ManaType::Blue)
+        .expect("pin the independently selected producer's actual unit")
+        .pip_id;
+    r.act(GameAction::SpendPoolMana { pip_id: aura_pip })
+        .unwrap();
+    r.act(GameAction::PassPriority).unwrap();
+    // CR 118.3a + CR 601.2h: that U pays the Signet's generic cost; all four
+    // Nykthos units remain, alongside the Signet's own B/R production.
+    assert!(r.state().objects[&signet].tapped);
+    assert!(r.state().objects[&nykthos].tapped);
+    assert_eq!(
+        r.state().players[0].mana_pool.count_color(ManaType::Green),
+        4
+    );
+    assert_eq!(
+        r.state().players[0].mana_pool.count_color(ManaType::Blue),
+        0
+    );
+    assert_eq!(
+        r.state().players[0].mana_pool.count_color(ManaType::Black),
+        1
+    );
+    assert_eq!(r.state().players[0].mana_pool.count_color(ManaType::Red), 1);
+    assert!(!r.state().players[0]
+        .mana_pool
+        .units()
+        .any(|unit| unit.pip_id == aura_pip));
+    assert_complete(&r, 6);
+}
