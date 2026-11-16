@@ -2,7 +2,7 @@ name: probe
 
 # Fork-only diagnostic runner for contribution candidates. Lives only on the
 # fork's main; never part of an upstream PR. Dispatch with:
-#   gh workflow run probe.yml -R bryanroscoe/phase --ref main \
+#   gh workflow run probe.yml -R bryanroscoe/phase --ref probe/runner-hygiene-20261116 \
 #     -f ref=<branch-or-sha> -f label=<unique-label> -f script="$(cat probe.sh)"
 # The script runs from the checkout root with $PROBE_OUT as its log directory;
 # everything written there is uploaded as artifact "probe-<label>".
@@ -52,7 +52,6 @@ jobs:
       - name: Free runner disk
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          if command -v docker >/dev/null 2>&1; then docker system prune --all --force || true; fi
           df -h /
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
