@@ -16531,6 +16531,21 @@ fn cached_auto_tap_sources<'a>(
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct PhaseOneResidualPlanWork {
+    next_invocation: usize,
+    residuals: Vec<(usize, ManaCost, &'static str, bool)>,
+    pool_residuals: Vec<(usize, ManaCost, ManaCost)>,
+    alternatives: Vec<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PHASE_ONE_RESIDUAL_PLAN_WORK: std::cell::RefCell<Option<PhaseOneResidualPlanWork>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn auto_tap_mana_sources_inner(
     state: &mut GameState,
@@ -16548,6 +16563,14 @@ fn auto_tap_mana_sources_inner(
     row_policy: AutoTapRowPolicy,
 ) {
     use crate::types::mana::ManaCost;
+
+    #[cfg(test)]
+    let invocation = PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+        counts.as_mut().map(|counts| {
+            counts.next_invocation += 1;
+            counts.next_invocation
+        })
+    });
 
     // An explicit nested policy wins. A `Choose` call made while an automatic
     // payment is executing (a mana ability's own sub-cost payment re-entering
@@ -16579,7 +16602,7 @@ fn auto_tap_mana_sources_inner(
         deprioritize_source,
         effective_ctx,
     );
-    let residual = state
+    let pool_residual = state
         .players
         .iter()
         .find(|p| p.id == player)
@@ -16593,16 +16616,25 @@ fn auto_tap_mana_sources_inner(
             )
         })
         .unwrap_or_else(|| cost.clone());
-
-    let (shards, generic) = match &residual {
+    #[cfg(test)]
+    PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+        if let (Some(counts), Some(invocation)) = (counts, invocation) {
+            counts
+                .pool_residuals
+                .push((invocation, cost.clone(), pool_residual.clone()));
+        }
+    });
+    // CR 106.4 + CR 601.2g: an already-funded payment needs no source
+    // snapshot. Keep that ordinary fast path, including actual activation
+    // costs whose independent prefunding has just completed.
+    match &pool_residual {
         ManaCost::NoCost
         | ManaCost::SelfManaCost
         | ManaCost::SelfManaValue
         | ManaCost::SelfManaCostReduced { .. } => return,
         ManaCost::Cost { shards, generic } if shards.is_empty() && *generic == 0 => return,
-        ManaCost::Cost { shards, generic } => (shards.as_slice(), *generic),
-    };
-
+        ManaCost::Cost { .. } => {}
+    }
     let available_buf;
     let available: &[ManaSourceOption] = if let Some(cached) = cached_auto_tap_sources(
         source_cache,
@@ -16647,17 +16679,102 @@ fn auto_tap_mana_sources_inner(
     });
     let available = filtered.as_deref().unwrap_or(available);
 
+    let floating_mana = state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .is_some_and(|p| p.mana_pool.total() > 0);
+    // One immutable source/context snapshot owns these exact-cost results.
+    // Keep unsuccessful plans too: the partial fallback must not repeat them.
+    let residual_plans: std::cell::RefCell<Vec<(ManaCost, (AutoTapPlan, AutoTapRowPolicy))>> =
+        std::cell::RefCell::new(Vec::new());
+    let fundable = |candidate: &ManaCost| {
+        let ManaCost::Cost { shards, generic } = candidate else {
+            return matches!(candidate, ManaCost::NoCost);
+        };
+        #[cfg(test)]
+        PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+            if let (Some(counts), Some(invocation)) = (counts, invocation) {
+                counts
+                    .residuals
+                    .push((invocation, candidate.clone(), "request", false));
+            }
+        });
+        if let Some((_, (plan, _))) = residual_plans
+            .borrow()
+            .iter()
+            .find(|(saved, _)| saved == candidate)
+        {
+            return plan.covers_cost;
+        }
+        let (needs, deferred) = auto_tap_needs(shards, mana_spend_permission);
+        let plan = choose_auto_tap_plan(
+            state,
+            available,
+            &needs,
+            *generic as usize + deferred,
+            effective_ctx,
+            row_policy,
+            floating_mana,
+        );
+        let covers_cost = plan.0.covers_cost;
+        #[cfg(test)]
+        PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+            if let (Some(counts), Some(invocation)) = (counts, invocation) {
+                counts
+                    .residuals
+                    .push((invocation, candidate.clone(), "evaluation", covers_cost));
+            }
+        });
+        residual_plans.borrow_mut().push((candidate.clone(), plan));
+        covers_cost
+    };
+    // CR 107.4e + CR 107.4h: pool allocations are scratch continuations;
+    // the same source planner decides which complete residual it can fund.
+    let ambiguous_hybrid = matches!(cost, ManaCost::Cost { shards, .. }
+        if shards.iter().any(|shard| matches!(mana_payment::shard_to_mana_type(*shard),
+            mana_payment::ShardRequirement::Hybrid(..)
+            | mana_payment::ShardRequirement::HybridPhyrexian(..)
+            | mana_payment::ShardRequirement::ColorlessHybrid(..))));
+    let residual = if ambiguous_hybrid && pool_residual != *cost {
+        #[cfg(test)]
+        PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+            if let (Some(counts), Some(invocation)) = (counts, invocation) {
+                counts.alternatives.push(invocation);
+            }
+        });
+        state
+            .players
+            .iter()
+            .find(|p| p.id == player)
+            .map(|p| {
+                mana_payment::reduce_cost_by_pool_with_fundability(
+                    &p.mana_pool,
+                    cost,
+                    effective_ctx,
+                    mana_spend_permission,
+                    sub_cost_demand,
+                    Some(&fundable),
+                )
+            })
+            .unwrap_or_else(|| cost.clone())
+    } else {
+        pool_residual
+    };
+    let (shards, generic) = match &residual {
+        ManaCost::NoCost
+        | ManaCost::SelfManaCost
+        | ManaCost::SelfManaValue
+        | ManaCost::SelfManaCostReduced { .. } => return,
+        ManaCost::Cost { shards, generic } if shards.is_empty() && *generic == 0 => return,
+        ManaCost::Cost { shards, generic } => (shards.as_slice(), *generic),
+    };
     // Build the typed shard-requirements list first — used by both the
     // combination pre-pass and the main MCV/LCV loop.
     let (needs, deferred_generic) = auto_tap_needs(shards, mana_spend_permission);
     // The row policy is decided once for the whole payment and inherited by every
     // nested mana sub-cost payment, so sibling sub-costs are funded under the plan
     // that was verified for them together.
-    let floating_mana = state
-        .players
-        .iter()
-        .find(|p| p.id == player)
-        .is_some_and(|p| p.mana_pool.total() > 0);
     let (
         AutoTapPlan {
             mut to_tap,
@@ -16665,15 +16782,47 @@ fn auto_tap_mana_sources_inner(
             ..
         },
         nested_row_policy,
-    ) = choose_auto_tap_plan(
-        state,
-        available,
-        &needs,
-        generic as usize + deferred_generic,
-        effective_ctx,
-        row_policy,
-        floating_mana,
-    );
+    ) = residual_plans
+        .into_inner()
+        .into_iter()
+        .find(|(chosen, _)| *chosen == residual)
+        .map(|(_, plan)| {
+            #[cfg(test)]
+            PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+                if let (Some(counts), Some(invocation)) = (counts, invocation) {
+                    counts.residuals.push((
+                        invocation,
+                        residual.clone(),
+                        "final reuse",
+                        plan.0.covers_cost,
+                    ));
+                }
+            });
+            plan
+        })
+        .unwrap_or_else(|| {
+            let plan = choose_auto_tap_plan(
+                state,
+                available,
+                &needs,
+                generic as usize + deferred_generic,
+                effective_ctx,
+                row_policy,
+                floating_mana,
+            );
+            #[cfg(test)]
+            PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|counts| {
+                if let (Some(counts), Some(invocation)) = (counts, invocation) {
+                    counts.residuals.push((
+                        invocation,
+                        residual.clone(),
+                        "evaluation",
+                        plan.0.covers_cost,
+                    ));
+                }
+            });
+            plan
+        });
 
     // Phase 3: activate each selected mana source.
     //
@@ -20002,6 +20151,229 @@ mod tests {
         let mut shards = vec![ManaCostShard::X];
         shards.extend_from_slice(extra);
         ManaCost::Cost { shards, generic: 0 }
+    }
+
+    #[test]
+    fn auto_tap_reuses_exact_residual_plans_within_one_invocation() {
+        use crate::game::scenario::{GameRunner, GameScenario};
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::{CastPaymentMode, WaitingFor};
+        use crate::types::mana::{parse_mtgjson_mana_cost, ManaColor};
+        use crate::types::zones::Zone;
+        // Frostburn Weird: "{U/R}: This creature gets +1/-1 until end of turn."
+        // Its printed {U/R}{U/R} leaves one {U/R} after Island's "({T}: Add {U}.)".
+        // Mountain's "({T}: Add {R}.)" funds it; Wastes' "{T}: Add {C}." cannot.
+        // CR 107.4e + CR 601.2g/h: source plans are exact, invocation-local proofs.
+        const WEIRD: &str = "{U/R}: This creature gets +1/-1 until end of turn.";
+        let reset_work = || {
+            PHASE_ONE_RESIDUAL_PLAN_WORK
+                .with_borrow_mut(|work| *work = Some(PhaseOneResidualPlanWork::default()))
+        };
+        let take_work =
+            || PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow_mut(|work| work.take().unwrap());
+        let float = |runner: &mut GameRunner, land, color| {
+            let (_, _, actions) = crate::ai_support::legal_actions_full(runner.state());
+            let action = actions[&land]
+                .iter()
+                .find(|action| {
+                    matches!(action,
+                GameAction::TapLandForMana { selection } if selection.mana_type == color)
+                })
+                .unwrap()
+                .clone();
+            runner.act(action).unwrap();
+        };
+
+        // Empty-pool spell payment never enters source-funded alternatives.
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let mountains: Vec<_> = (0..2)
+            .map(|_| scenario.add_basic_land(P0, ManaColor::Red))
+            .collect();
+        let weird = scenario
+            .add_creature_to_hand_from_oracle(P0, "Frostburn Weird", 1, 4, WEIRD)
+            .with_subtypes(vec!["Weird"])
+            .with_mana_cost(parse_mtgjson_mana_cost("{U/R}{U/R}"))
+            .id();
+        let mut runner = scenario.build();
+        reset_work();
+        runner
+            .cast(weird)
+            .resolve()
+            .assert_zone(&[weird], Zone::Battlefield);
+        let work = take_work();
+        assert!(work
+            .pool_residuals
+            .iter()
+            .any(|(_, original, residual)| original == residual));
+        for (invocation, original, residual) in &work.pool_residuals {
+            if original == residual {
+                assert!(!work.alternatives.contains(invocation));
+            }
+        }
+        assert!(mountains.iter().all(|id| runner.state().objects[id].tapped));
+        assert!(runner.state().stack.is_empty());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().players[0].mana_pool.is_empty());
+
+        // One U leaves the exact same hybrid residual on both defer paths.
+        // Every inner invocation owns its requests, evaluations and final reuse;
+        // live refreshes and the later payment get distinct invocation labels.
+        for payable in [false, true] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+            let island = scenario.add_basic_land(P0, ManaColor::Blue);
+            let wastes = scenario
+                .add_land_from_oracle(P0, "Wastes", "{T}: Add {C}.")
+                .id();
+            let mountain = payable.then(|| scenario.add_basic_land(P0, ManaColor::Red));
+            let weird = scenario
+                .add_creature_to_hand_from_oracle(P0, "Frostburn Weird", 1, 4, WEIRD)
+                .with_subtypes(vec!["Weird"])
+                .with_mana_cost(parse_mtgjson_mana_cost("{U/R}{U/R}"))
+                .id();
+            let mut runner = scenario.build();
+            float(&mut runner, island, ManaType::Blue);
+            assert_eq!(
+                runner.state().players[0]
+                    .mana_pool
+                    .count_color(ManaType::Blue),
+                1
+            );
+            assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+            let cost = parse_mtgjson_mana_cost("{U/R}{U/R}");
+            let residual = parse_mtgjson_mana_cost("{U/R}");
+            let meta = super::super::casting::build_spell_meta(runner.state(), P0, weird).unwrap();
+            reset_work();
+            let mut events = Vec::new();
+            auto_tap_mana_sources_with_context(
+                runner.state_mut(),
+                P0,
+                &cost,
+                &mut events,
+                Some(weird),
+                Some(&PaymentContext::Spell(&meta)),
+            );
+            let measured = PHASE_ONE_RESIDUAL_PLAN_WORK.with_borrow(|work| {
+                work.as_ref()
+                    .unwrap()
+                    .residuals
+                    .iter()
+                    .find(|(_, candidate, kind, _)| *candidate == residual && *kind == "request")
+                    .unwrap()
+                    .0
+            });
+            if let Some(mountain) = mountain {
+                assert!(runner.state().objects[&mountain].tapped);
+                assert_eq!(events.iter().filter(|event| matches!(event,
+                    GameEvent::ManaAdded { source_id, mana_type: ManaType::Red, .. } if *source_id == mountain)).count(), 1);
+                runner
+                    .cast(weird)
+                    .resolve()
+                    .assert_zone(&[weird], Zone::Battlefield);
+                assert!(runner.state().players[0].mana_pool.is_empty());
+                // The previous Mountain is now tapped. A new payment of the
+                // same exact residual must reevaluate and find it unfundable.
+                let activation = super::super::casting::activation_payment_context(
+                    runner.state(),
+                    weird,
+                    Some(0),
+                );
+                auto_tap_mana_sources_with_context(
+                    runner.state_mut(),
+                    P0,
+                    &residual,
+                    &mut events,
+                    Some(weird),
+                    Some(&activation.as_payment_context()),
+                );
+            } else {
+                assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+                assert!(runner.cast(weird).try_resolve().is_err());
+                assert_eq!(runner.state().objects[&weird].zone, Zone::Hand);
+            }
+            let work = take_work();
+            let requests = work
+                .residuals
+                .iter()
+                .filter(|(invocation, candidate, kind, _)| {
+                    *invocation == measured && *candidate == residual && *kind == "request"
+                })
+                .count();
+            assert!(requests > 0);
+            if !payable {
+                assert!(
+                    requests > 1,
+                    "reach the repeated false request within this invocation"
+                );
+            }
+            assert_eq!(
+                work.residuals
+                    .iter()
+                    .filter(
+                        |(invocation, candidate, kind, result)| *invocation == measured
+                            && *candidate == residual
+                            && *kind == "evaluation"
+                            && *result == payable
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(
+                work.residuals
+                    .iter()
+                    .filter(
+                        |(invocation, candidate, kind, result)| *invocation == measured
+                            && *candidate == residual
+                            && *kind == "final reuse"
+                            && *result == payable
+                    )
+                    .count(),
+                1
+            );
+            for (invocation, candidate, kind, _) in &work.residuals {
+                if *kind == "request" {
+                    assert_eq!(
+                        work.residuals
+                            .iter()
+                            .filter(|(other_invocation, other_candidate, other_kind, _)| {
+                                other_invocation == invocation
+                                    && other_candidate == candidate
+                                    && *other_kind == "evaluation"
+                            })
+                            .count(),
+                        1
+                    );
+                }
+            }
+            if payable {
+                assert!(work
+                    .residuals
+                    .iter()
+                    .any(
+                        |(invocation, candidate, kind, result)| *invocation != measured
+                            && *candidate == residual
+                            && *kind == "evaluation"
+                            && !result
+                    ));
+                assert!(runner
+                    .act(GameAction::ActivateAbility {
+                        source_id: weird,
+                        ability_index: 0,
+                        payment_mode: CastPaymentMode::Auto
+                    })
+                    .is_err());
+            }
+            assert!(!runner.state().objects[&wastes].tapped);
+            assert!(runner.state().stack.is_empty());
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+        }
     }
 
     /// CR 107.3a + CR 602.1a: "contains {X}" means the `{X}` mana symbol, read
