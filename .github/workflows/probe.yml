@@ -1,0 +1,111 @@
+name: probe
+
+# Fork-only diagnostic runner for contribution candidates. Lives only on the
+# fork's main; never part of an upstream PR. Dispatch with:
+#   gh workflow run probe.yml -R bryanroscoe/phase --ref main \
+#     -f ref=<branch-or-sha> -f label=<unique-label> -f script="$(cat probe.sh)"
+# The script runs from the checkout root with $PROBE_OUT as its log directory;
+# everything written there is uploaded as artifact "probe-<label>".
+
+run-name: probe ${{ inputs.label }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit in this repository to check out
+        required: true
+        type: string
+      label:
+        description: Unique label (used in the run name and artifact name)
+        required: true
+        type: string
+      script:
+        description: Bash script to run from the checkout root
+        required: true
+        type: string
+      carddata:
+        description: Download MTGJSON AtomicCards.json into data/mtgjson first
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe ${{ inputs.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/phase-rs/phase.git
+          git fetch --no-tags upstream main
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          if command -v docker >/dev/null 2>&1; then docker system prune --all --force || true; fi
+          df -h /
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: wasm32-unknown-unknown
+          cache-shared-key: rust-debug
+
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Enable sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-nextest
+
+      - name: Card data
+        if: ${{ inputs.carddata }}
+        run: |
+          if [ ! -f data/mtgjson/AtomicCards.json ]; then
+            mkdir -p data/mtgjson
+            source scripts/lib/mtgjson-fetch.sh
+            mtgjson_download AtomicCards.json data/mtgjson/AtomicCards.json
+          fi
+
+      - name: Run probe script
+        env:
+          PROBE_SCRIPT: ${{ inputs.script }}
+        run: |
+          export PROBE_OUT="$GITHUB_WORKSPACE/../probe-out"
+          mkdir -p "$PROBE_OUT"
+          printf '%s\n' "$PROBE_SCRIPT" > "$PROBE_OUT/probe.sh"
+          git rev-parse HEAD > "$PROBE_OUT/head.txt"
+          set +e
+          bash "$PROBE_OUT/probe.sh" 2>&1 | tee "$PROBE_OUT/console.log"
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$PROBE_OUT/exit-status.txt"
+          {
+            echo "### probe ${{ inputs.label }} — exit $status"
+            echo '```'
+            tail -n 60 "$PROBE_OUT/console.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: probe-${{ inputs.label }}
+          path: ${{ github.workspace }}/../probe-out
+          retention-days: 14
+          if-no-files-found: warn
