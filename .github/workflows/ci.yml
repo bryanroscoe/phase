@@ -306,9 +306,10 @@ jobs:
     name: Rust tests (shard ${{ matrix.shard }}/4)
     needs: rust-test-build
     runs-on: ubuntu-latest
-    # A shard hit the 30-minute ceiling after over 10 minutes of archive setup;
-    # allow 45 minutes for setup, extraction, and test execution.
-    timeout-minutes: 45
+    # Shard 4 completed all 10,494 tests after roughly 10 minutes of archive
+    # setup, then hit the 45-minute job deadline before a successful exit.
+    # Keep the full partitions and property cases, with bounded setup headroom.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
